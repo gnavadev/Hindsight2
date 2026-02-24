@@ -1,124 +1,183 @@
 """
-Response Viewer Component
+Input Panel Component
 
-Displays LLM responses with:
-- Markdown rendering support (via markdown library)
-- Code syntax highlighting (via pygments)
-- Structured JSON display
+Multi-modal input interface supporting:
+- Text input
+- Image attachments (screenshot, file upload)
+- Audio recording (microphone, system audio)
+- Send button and Ctrl+Enter shortcut
 """
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QTextBrowser, QHBoxLayout, QLabel
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
-import markdown
-from pygments import highlight
-from pygments.formatters import HtmlFormatter
-from pygments.lexers import get_lexer_by_name, guess_lexer
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
+    QPushButton, QLabel, QFileDialog, QScrollArea
+)
+from PySide6.QtCore import Signal, Qt, QSize
+from PySide6.QtGui import QKeySequence, QShortcut, QPixmap
+from PIL import Image
+import io
 
 
-class ResponseViewer(QWidget):
-    """Component for displaying LLM responses with markdown support"""
-    
+class InputPanel(QWidget):
+    """Multi-modal input panel for sending messages to LLMs"""
+
+    send_requested = Signal(dict)
+
     def __init__(self):
         super().__init__()
+        self._images = []
+        self._audio_file = None
         self._setup_ui()
-        self._init_markdown_css()
-    
+
     def _setup_ui(self):
-        """Setup the response viewer UI"""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
-        
+
         # Header
         header_layout = QHBoxLayout()
-        header_label = QLabel("💬 Response")
-        header_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #4682d4;")
+        header_label = QLabel("📝 Input")
+        header_label.setStyleSheet("font-size: 12pt; font-weight: bold; color: #4682d4;")
         header_layout.addWidget(header_label)
         header_layout.addStretch()
         layout.addLayout(header_layout)
-        
-        # Text browser for Markdown content
-        self.browser = QTextBrowser()
-        self.browser.setOpenExternalLinks(True)
-        # Default styling
-        self.browser.setStyleSheet("""
-            QTextBrowser {
-                background-color: #2b2b2b;
-                color: #e0e0e0;
-                border: 1px solid #3e3e42;
-                font-family: 'Segoe UI', sans-serif;
-                font-size: 14px;
-                padding: 10px;
+
+        # Text input
+        self.text_input = QTextEdit()
+        self.text_input.setPlaceholderText("Type your message here... (Ctrl+Enter to send)")
+        self.text_input.setMinimumHeight(100)
+        layout.addWidget(self.text_input)
+
+        # Attachments preview
+        self.attachments_area = QScrollArea()
+        self.attachments_area.setMaximumHeight(120)
+        self.attachments_area.setWidgetResizable(True)
+        self.attachments_area.setVisible(False)
+        self.attachments_widget = QWidget()
+        self.attachments_layout = QHBoxLayout(self.attachments_widget)
+        self.attachments_area.setWidget(self.attachments_widget)
+        layout.addWidget(self.attachments_area)
+
+        # Buttons bar
+        buttons_layout = QHBoxLayout()
+
+        self.image_btn = QPushButton("📷 Image")
+        self.image_btn.setToolTip("Add image from file")
+        self.image_btn.clicked.connect(self._add_image_from_file)
+        buttons_layout.addWidget(self.image_btn)
+
+        self.mic_btn = QPushButton("🎤 Microphone")
+        self.mic_btn.setToolTip("Record from microphone")
+        self.mic_btn.clicked.connect(self._toggle_mic_recording)
+        buttons_layout.addWidget(self.mic_btn)
+
+        self.system_audio_btn = QPushButton("🔊 System Audio")
+        self.system_audio_btn.setToolTip("Record system audio")
+        self.system_audio_btn.clicked.connect(self._toggle_system_audio_recording)
+        buttons_layout.addWidget(self.system_audio_btn)
+
+        buttons_layout.addStretch()
+
+        self.clear_btn = QPushButton("🗑️ Clear")
+        self.clear_btn.setToolTip("Clear all inputs")
+        self.clear_btn.clicked.connect(self._clear_all)
+        buttons_layout.addWidget(self.clear_btn)
+
+        self.send_btn = QPushButton("✉️ Send")
+        self.send_btn.setToolTip("Send message (Ctrl+Enter)")
+        self.send_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4682d4;
+                color: white;
+                font-weight: bold;
+                padding: 8px 20px;
             }
+            QPushButton:hover { background-color: #5792e4; }
+            QPushButton:pressed { background-color: #3672c4; }
         """)
-        layout.addWidget(self.browser)
-    
-    def _init_markdown_css(self):
-        """Initialize CSS for code blocks and markdown elements"""
-        # Get Pygments CSS
-        formatter = HtmlFormatter(style='monokai', cssclass='codehilite')
-        pygments_css = formatter.get_style_defs('.codehilite')
-        
-        # Custom CSS for other markdown elements
-        self.markdown_css = f"""
-        <style>
-            body {{ font-family: 'Segoe UI', sans-serif; color: #e0e0e0; }}
-            h1, h2, h3, h4 {{ color: #4682d4; margin-top: 20px; }}
-            a {{ color: #5792e4; text-decoration: none; }}
-            code {{ background-color: #3e3e42; padding: 2px 4px; border-radius: 3px; font-family: 'Consolas', monospace; }}
-            pre {{ background-color: #272822; padding: 10px; border-radius: 5px; overflow-x: auto; }}
-            blockquote {{ border-left: 4px solid #4682d4; margin: 0; padding-left: 10px; color: #a0a0a0; }}
-            table {{ border-collapse: collapse; width: 100%; margin: 15px 0; }}
-            th, td {{ border: 1px solid #3e3e42; padding: 8px; text-align: left; }}
-            th {{ background-color: #3e3e42; color: #ffffff; }}
-            tr:nth-child(even) {{ background-color: #323232; }}
-            
-            /* Pygments CSS */
-            {pygments_css}
-        </style>
-        """
-    
-    def set_response(self, text: str, is_markdown: bool = True):
-        """Display a response"""
-        if not is_markdown:
-            # Plain text
-            self.browser.setPlainText(text)
-            return
-            
-        # Convert Markdown to HTML
-        try:
-            html_content = markdown.markdown(
-                text,
-                extensions=[
-                    'fenced_code',
-                    'codehilite',
-                    'tables',
-                    'nl2br',
-                    'pymdownx.superfences'
-                ],
-                extension_configs={
-                    'codehilite': {
-                        'css_class': 'codehilite',
-                        'noclasses': False,
-                        'use_pygments': True
-                    }
-                }
+        self.send_btn.clicked.connect(self._send_message)
+        buttons_layout.addWidget(self.send_btn)
+
+        layout.addLayout(buttons_layout)
+
+        send_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        send_shortcut.activated.connect(self._send_message)
+
+    def add_image(self, image):
+        if isinstance(image, Image.Image):
+            self._images.append(image)
+            self._update_attachments_preview()
+
+    def _add_image_from_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif)"
+        )
+        if file_path:
+            try:
+                self.add_image(Image.open(file_path))
+            except Exception as e:
+                print(f"Error loading image: {e}")
+
+    def _toggle_mic_recording(self):
+        if self.mic_btn.text() == "🎤 Microphone":
+            self.mic_btn.setText("⏹️ Stop Recording")
+            self.mic_btn.setStyleSheet("background-color: #c42b1c;")
+        else:
+            self.mic_btn.setText("🎤 Microphone")
+            self.mic_btn.setStyleSheet("")
+
+    def _toggle_system_audio_recording(self):
+        if self.system_audio_btn.text() == "🔊 System Audio":
+            self.system_audio_btn.setText("⏹️ Stop Recording")
+            self.system_audio_btn.setStyleSheet("background-color: #c42b1c;")
+        else:
+            self.system_audio_btn.setText("🔊 System Audio")
+            self.system_audio_btn.setStyleSheet("")
+
+    def _update_attachments_preview(self):
+        # Clear existing previews
+        while self.attachments_layout.count():
+            item = self.attachments_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:           # fix: guard before calling deleteLater
+                w.deleteLater()
+
+        self.attachments_area.setVisible(len(self._images) > 0)
+
+        for i, img in enumerate(self._images):
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            pixmap = QPixmap()
+            pixmap.loadFromData(buf.getvalue())
+
+            # fix: use proper v6 enum namespaces
+            thumbnail = pixmap.scaled(
+                100, 100,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
             )
-            
-            # Add CSS and set HTML
-            full_html = f"{self.markdown_css}\n{html_content}"
-            self.browser.setHtml(full_html)
-            
-        except Exception as e:
-            print(f"Markdown rendering error: {e}")
-            self.browser.setPlainText(text)
-    
-    def append_response(self, text: str):
-        """Append to existing response (basic implementation)"""
-        current = self.browser.toPlainText()
-        self.set_response(current + text)
-        self.browser.moveCursor(self.browser.textCursor().End)
-    
-    def clear(self):
-        """Clear the response display"""
-        self.browser.clear()
+
+            lbl = QLabel()
+            lbl.setPixmap(thumbnail)
+            lbl.setToolTip(f"Image {i + 1}")
+            lbl.setStyleSheet("border: 1px solid #555; padding: 2px;")
+            self.attachments_layout.addWidget(lbl)
+
+        self.attachments_layout.addStretch()
+
+    def _clear_all(self):
+        self.text_input.clear()
+        self._images.clear()
+        self._audio_file = None
+        self._update_attachments_preview()
+
+    def _send_message(self):
+        text = self.text_input.toPlainText().strip()
+        if not text and not self._images and not self._audio_file:
+            return
+        self.send_requested.emit({
+            'text': text,
+            'images': self._images.copy(),
+            'audio': self._audio_file,
+        })
+        self._clear_all()

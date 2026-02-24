@@ -3,7 +3,9 @@ Privacy Window Module
 
 Implements Windows API display affinity to create a window that:
 - Is visible to the user
-- Is invisible to screen sharing/recording software
+- Is invisible to screen sharing/recording software (appears transparent in captures)
+
+Requires Windows 10 version 2004 (build 19041) or later.
 """
 
 import ctypes
@@ -11,87 +13,84 @@ from ctypes import wintypes
 from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import Qt
 
-
 # Windows API Constants
-WDA_EXCLUDEFROMCAPTURE = 0x00000011
-GWL_EXSTYLE = -20
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_LAYERED = 0x00080000
+WDA_NONE             = 0x00000000
+WDA_MONITOR          = 0x00000001
+WDA_EXCLUDEFROMCAPTURE = 0x00000011  # Win10 2004+ — excluded region shows as transparent in captures
+GWL_EXSTYLE          = -20
+WS_EX_TRANSPARENT    = 0x00000020
+WS_EX_LAYERED        = 0x00080000
+
 
 class PrivacyWindow(QWidget):
     """
-    Base privacy window class that applies Windows API display affinity
-    to exclude the window from screen capture.
+    Base privacy window that applies SetWindowDisplayAffinity to exclude
+    the window from screen capture. Requires the window to be fully created
+    (shown) before the affinity can be applied — do NOT call before show().
     """
-    
+
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        
-        # Privacy setup
-        self._apply_display_affinity()
-        
-    def _get_hwnd(self):
-        """Get the correct HWND for the window"""
-        # In PySide6, winId() returns the HWND on Windows
-        return int(self.winId())
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # NOTE: _apply_display_affinity is intentionally NOT called here.
+        # The HWND is not valid until the native window is created (first showEvent).
+        self._privacy_pending = True  # Will be applied on first show
+
+    def _get_hwnd(self) -> int:
+        hwnd = int(self.winId())
+        if not hwnd:
+            raise RuntimeError("Window has no valid HWND yet")
+        return hwnd
 
     def set_privacy_mode(self, enabled: bool):
         """
-        Toggle privacy mode (exclusion from screen capture).
-        Note: When enabled, this creates a black box in screen shares.
+        Toggle exclusion from screen capture.
+        When enabled the window region appears TRANSPARENT (not black) in
+        captures on Windows 10 2004+ / Windows 11.
+        The black-box symptom means the call is happening before the native
+        window exists — this class ensures it only runs after showEvent.
         """
         try:
-            hwnd = self._get_hwnd()
-            if not hwnd:
-                print("No HWND found for privacy toggle")
-                return
+            hwnd     = self._get_hwnd()
+            user32   = ctypes.windll.user32
+            affinity = WDA_EXCLUDEFROMCAPTURE if enabled else WDA_NONE
 
-            user32 = ctypes.windll.user32
-            affinity = WDA_EXCLUDEFROMCAPTURE if enabled else 0x00000000  # WDA_NONE
-            
             result = user32.SetWindowDisplayAffinity(hwnd, affinity)
-            
             if result == 0:
-                error_code = ctypes.get_last_error()
-                print(f"Warning: Failed to set display affinity. Error: {error_code}")
+                err = ctypes.get_last_error()
+                print(f"Warning: SetWindowDisplayAffinity failed. Error: {err}")
             else:
-                state = "enabled" if enabled else "disabled"
-                print(f"✓ Privacy mode {state}")
-                
+                print(f"✓ Privacy mode {'enabled' if enabled else 'disabled'}")
+
+        except RuntimeError as e:
+            # HWND not ready — will retry on next showEvent
+            print(f"Privacy mode deferred: {e}")
+            self._privacy_pending = enabled
         except Exception as e:
             print(f"Error toggling privacy mode: {e}")
 
     def _apply_display_affinity(self):
-        """Apply SetWindowDisplayAffinity to exclude from capture"""
         self.set_privacy_mode(True)
 
     def showEvent(self, event):
-        """Re-apply privacy when window is shown"""
+        """Re-apply privacy every time the window becomes visible."""
         super().showEvent(event)
         self._apply_display_affinity()
-        
+
     def set_click_through(self, enabled: bool):
-        """
-        Toggle click-through mode.
-        If enabled, the window ignores mouse clicks (passed to window behind).
-        """
+        """Toggle click-through (mouse events pass to the window behind)."""
         try:
-            hwnd = self._get_hwnd()
+            hwnd   = self._get_hwnd()
             user32 = ctypes.windll.user32
-            
-            # Get current styles
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            
+            style  = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+
             if enabled:
-                # Add transparent and layered styles
                 new_style = style | WS_EX_TRANSPARENT | WS_EX_LAYERED
             else:
-                # Remove transparent style (keep layered if needed)
-                new_style = style & ~WS_EX_TRANSPARENT
-                
+                new_style = style & ~WS_EX_TRANSPARENT  # keep WS_EX_LAYERED for opacity
+
             user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
-            
+
         except Exception as e:
             print(f"Error setting click-through: {e}")
