@@ -4,11 +4,13 @@ Base LLM Provider
 Abstract base class defining the interface for all LLM providers.
 """
 
-from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
-from PIL import Image
 import json
+import logging
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Optional, Generator
+from PIL import Image
 
+logger = logging.getLogger(__name__)
 
 class BaseLLMProvider(ABC):
     """Abstract base class for LLM providers"""
@@ -27,15 +29,6 @@ class BaseLLMProvider(ABC):
     ) -> Dict[str, Any]:
         """
         Send a message to the LLM.
-        
-        Args:
-            text: Text message
-            images: List of PIL Images
-            audio_file: Path to audio file
-            system_prompt: System prompt/instructions
-        
-        Returns:
-            Dict with 'response' and 'metadata' keys
         """
         pass
     
@@ -46,38 +39,33 @@ class BaseLLMProvider(ABC):
         images: Optional[List[Image.Image]] = None,
         audio_file: Optional[str] = None,
         system_prompt: Optional[str] = None
-    ):
+    ) -> Generator[str, Any, None]:
         """
         Stream response from LLM (generator).
-        
-        Yields:
-            Text chunks as they arrive
         """
         pass
     
     def parse_structured_output(self, response_text: str) -> Dict[str, Any]:
         """
-        Parse structured JSON output from LLM response.
-        
-        Args:
-            response_text: Raw response text
-        
-        Returns:
-            Parsed JSON dict, or {'raw': response_text} if parsing fails
+        Parse structured JSON output from LLM response reliably.
         """
+        if not response_text:
+            logger.warning("Received empty response text to parse.")
+            return {"error": "Empty response from API"}
+
         try:
             # Try to extract JSON from markdown code blocks
             if "```json" in response_text:
                 start = response_text.find("```json") + 7
-                end = response_text.find("```", start)
+                end = response_text.rfind("```")
                 json_str = response_text[start:end].strip()
                 return json.loads(json_str)
             
-            # Try to parse as pure JSON
+            # Fallback to direct JSON parsing
             return json.loads(response_text)
-        except json.JSONDecodeError:
-            # Return raw text if not JSON
-            return {"raw": response_text}
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON: {e} | Raw text preview: {response_text[:150]}...")
+            return {"raw": response_text, "error": f"JSON Parsing Error: {str(e)}"}
     
     @property
     def model_name(self) -> str:

@@ -41,7 +41,7 @@ def set_stealth_mode(hwnd):
         
         result = user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
         if result == 0:
-            print(f"Failed to set stealh mode. Error: {ctypes.get_last_error()}")
+            print(f"Failed to set stealth mode. Error: {ctypes.get_last_error()}")
         else:
             print("Successfully set stealth mode (WS_EX_TOOLWINDOW).")
             
@@ -67,18 +67,21 @@ def main():
     label = tk.Label(frame, text=label_text, fg="white", bg="black", font=("Arial", 12), justify="center")
     label.pack(expand=True)
     
+    # Use a dictionary to store drag state instead of modifying the Tk instance
+    drag_data = {"x": 0, "y": 0}
+    
     # Add simple drag functionality since title bar is gone
     def start_move(event):
-        root.x = event.x
-        root.y = event.y
+        drag_data["x"] = event.x
+        drag_data["y"] = event.y
 
     def stop_move(event):
-        root.x = None
-        root.y = None
+        drag_data["x"] = 0
+        drag_data["y"] = 0
 
     def do_move(event):
-        deltax = event.x - root.x
-        deltay = event.y - root.y
+        deltax = event.x - drag_data["x"]
+        deltay = event.y - drag_data["y"]
         x = root.winfo_x() + deltax
         y = root.winfo_y() + deltay
         root.geometry(f"+{x}+{y}")
@@ -94,9 +97,6 @@ def main():
     root.update()
     
     # Get window handle - For overrideredirect windows, we might need the parent or wrapper
-    # But often winfo_id works, or we find by class/title if strictly necessary.
-    # With overrideredirect, FindWindow might fail if title isn't published the same way.
-    # Let's try winfo_id first as it should be the HWND wrapper.
     hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
     if not hwnd:
         hwnd = root.winfo_id()

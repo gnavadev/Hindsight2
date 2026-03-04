@@ -9,9 +9,12 @@ Requires Windows 10 version 2004 (build 19041) or later.
 """
 
 import ctypes
+import logging
 from ctypes import wintypes
 from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import Qt
+
+logger = logging.getLogger(__name__)
 
 # Windows API Constants
 WDA_NONE             = 0x00000000
@@ -59,16 +62,16 @@ class PrivacyWindow(QWidget):
             result = user32.SetWindowDisplayAffinity(hwnd, affinity)
             if result == 0:
                 err = ctypes.get_last_error()
-                print(f"Warning: SetWindowDisplayAffinity failed. Error: {err}")
+                logger.warning(f"SetWindowDisplayAffinity failed (error {err})")
             else:
-                print(f"✓ Privacy mode {'enabled' if enabled else 'disabled'}")
+                logger.info(f"Privacy mode {'enabled' if enabled else 'disabled'}")
 
         except RuntimeError as e:
             # HWND not ready — will retry on next showEvent
-            print(f"Privacy mode deferred: {e}")
+            logger.debug(f"Privacy mode deferred: {e}")
             self._privacy_pending = enabled
         except Exception as e:
-            print(f"Error toggling privacy mode: {e}")
+            logger.error(f"Error toggling privacy mode: {e}", exc_info=True)
 
     def _apply_display_affinity(self):
         self.set_privacy_mode(True)
@@ -91,6 +94,7 @@ class PrivacyWindow(QWidget):
                 new_style = style & ~WS_EX_TRANSPARENT  # keep WS_EX_LAYERED for opacity
 
             user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+            logger.debug(f"Click-through {'enabled' if enabled else 'disabled'}")
 
         except Exception as e:
-            print(f"Error setting click-through: {e}")
+            logger.error(f"Error setting click-through: {e}", exc_info=True)

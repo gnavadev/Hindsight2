@@ -8,6 +8,8 @@ Combines all UI components into the main application window with:
 - Keyboard shortcuts
 """
 
+import logging
+import time
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QWidget, QMessageBox, QInputDialog,
     QTextBrowser, QSizePolicy, QLineEdit
@@ -23,6 +25,8 @@ from config.settings import Settings
 from llm.gemini_provider import GeminiProvider
 from llm.smart_provider import SmartGeminiProvider
 from llm.claude_provider import ClaudeProvider
+
+logger = logging.getLogger(__name__)
 
 # ------------------------
 # PySide6 v6 enum aliases
@@ -78,7 +82,7 @@ class MainWindow(PrivacyWindow):
         self.hotkey_ids = {}
         self._setup_global_hotkeys()
 
-        print("✓ Overlay initialized")
+        logger.info("Overlay initialized")
 
     # ------------------------------------------------------------------
     # Positioning
@@ -269,9 +273,9 @@ class MainWindow(PrivacyWindow):
         for hk_id, (mod, vk, _) in self.hotkeys.items():
             if self.user32.RegisterHotKey(hwnd, hk_id, mod, vk):
                 self.hotkey_ids[hk_id] = self.hotkeys[hk_id][2]
-                print(f"Registered hotkey ID {hk_id}")
+                logger.debug(f"Registered hotkey ID {hk_id}")
             else:
-                print(f"Failed to register hotkey ID {hk_id}")
+                logger.warning(f"Failed to register hotkey ID {hk_id}")
 
     def _register_dynamic_hotkey(self, hk_id):
         if hk_id in self.registered_dynamic_ids or hk_id not in self.dynamic_hotkeys:
@@ -280,9 +284,9 @@ class MainWindow(PrivacyWindow):
         if self.user32.RegisterHotKey(int(self.winId()), hk_id, mod, vk):
             self.hotkey_ids[hk_id] = func
             self.registered_dynamic_ids.add(hk_id)
-            print(f"Registered dynamic hotkey ID {hk_id}")
+            logger.debug(f"Registered dynamic hotkey ID {hk_id}")
         else:
-            print(f"Failed to register dynamic hotkey ID {hk_id}")
+            logger.warning(f"Failed to register dynamic hotkey ID {hk_id}")
 
     def _unregister_dynamic_hotkey(self, hk_id):
         if hk_id not in self.registered_dynamic_ids:
@@ -290,7 +294,7 @@ class MainWindow(PrivacyWindow):
         if self.user32.UnregisterHotKey(int(self.winId()), hk_id):
             self.hotkey_ids.pop(hk_id, None)
             self.registered_dynamic_ids.discard(hk_id)
-            print(f"Unregistered dynamic hotkey ID {hk_id}")
+            logger.debug(f"Unregistered dynamic hotkey ID {hk_id}")
 
     def nativeEvent(self, event_type, message):
         try:
@@ -302,7 +306,7 @@ class MainWindow(PrivacyWindow):
                         self.hotkey_ids[hk_id]()
                         return True, 0
         except Exception as e:
-            print(f"Error in nativeEvent: {e}")
+            logger.error(f"Error in nativeEvent: {e}", exc_info=True)
         return super().nativeEvent(event_type, message)
 
     def _setup_shortcuts(self):
@@ -317,7 +321,7 @@ class MainWindow(PrivacyWindow):
         try:
             from capture.screenshot import capture_screenshot
             from PySide6.QtWidgets import QApplication
-            import time
+            import time as _time
 
             geo = self.geometry()
             center_x = geo.x() + geo.width() // 2
@@ -329,7 +333,7 @@ class MainWindow(PrivacyWindow):
             self.hide()
 
             QApplication.processEvents()
-            time.sleep(0.5)
+            _time.sleep(0.5)
             QApplication.processEvents()
 
             self.current_image = capture_screenshot((center_x, center_y))
@@ -356,13 +360,18 @@ class MainWindow(PrivacyWindow):
                 from PySide6.QtCore import QTimer
                 QTimer.singleShot(50, self.adjust_height_to_content)
                 self._register_dynamic_hotkey(201)
+                logger.info("Screenshot captured and preview shown")
+            else:
+                logger.warning("Screenshot capture returned None")
+                self.response_viewer.setText("Screenshot failed — check logs.")
 
         except Exception as e:
-            print(f"Screenshot error: {e}")
+            logger.error(f"Screenshot error: {e}", exc_info=True)
             self.response_viewer.setText(f"Screenshot error: {e}")
 
     def _handle_send(self):
         if not hasattr(self, 'current_image') or not self.current_image:
+            logger.debug("_handle_send called but no current_image available")
             return
 
         self._unregister_dynamic_hotkey(201)
@@ -374,48 +383,72 @@ class MainWindow(PrivacyWindow):
         self.repaint()
 
         if self.llm_provider:
+            send_start = time.time()
             try:
+                logger.info("Sending image to LLM provider...")
                 response = self.llm_provider.send_message(
                     text="Analyze this image.",
                     images=[self.current_image]
                 )
+                elapsed = time.time() - send_start
+                logger.info(f"LLM response received in {elapsed:.1f}s")
+
                 text_response = response.get('response', 'No response')
 
-                html_content = markdown.markdown(
-                    text_response,
-                    extensions=['fenced_code', 'codehilite']
-                )
-                formatter = HtmlFormatter(style='monokai', noclasses=True)
-                pygments_css = formatter.get_style_defs('.codehilite')
+                # Log metadata if available
+                metadata = response.get('metadata', {})
+                if metadata:
+                    logger.debug(f"Response metadata: model={metadata.get('model')}, timing={metadata.get('timing')}")
 
-                styled_html = f"""
-                <style>
-                    body {{ font-family: 'Segoe UI', sans-serif; color: #e0e0e0; margin: 0; }}
-                    p {{ margin-bottom: 10px; margin-top: 0; }}
-                    a {{ color: #4facfe; }}
-                    pre {{
-                        background-color: #272822;
-                        padding: 12px;
-                        border-radius: 6px;
-                        border: 1px solid #444;
-                        overflow-x: auto;
-                        margin: 8px 0;
-                        line-height: 1.2;
-                    }}
-                    pre * {{ margin: 0; padding: 0; }}
-                    code {{ font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; }}
-                    p code {{ background-color: #3e3e3e; padding: 2px 5px; border-radius: 4px; }}
-                    {pygments_css}
-                </style>
-                {html_content}
-                """
+                styled_html = self._render_markdown_to_html(text_response)
                 self.response_viewer.setHtml(styled_html)
                 QTimer.singleShot(100, self.adjust_height_to_content)
 
             except Exception as e:
+                elapsed = time.time() - send_start
+                logger.error(f"LLM send failed after {elapsed:.1f}s: {e}", exc_info=True)
                 self.response_viewer.setText(f"Error: {e}")
         else:
+            logger.warning("LLM provider not configured")
             self.response_viewer.setText("LLM not configured.")
+
+    def _render_markdown_to_html(self, md_text: str) -> str:
+        """Convert markdown text to styled HTML for the response viewer."""
+        try:
+            html_content = markdown.markdown(
+                md_text,
+                extensions=['fenced_code', 'codehilite']
+            )
+        except Exception as e:
+            logger.warning(f"Markdown rendering failed, using plain text: {e}")
+            # Escape HTML and preserve newlines  
+            import html
+            html_content = html.escape(md_text).replace('\n', '<br>')
+
+        formatter = HtmlFormatter(style='monokai', noclasses=True)
+        pygments_css = formatter.get_style_defs('.codehilite')
+
+        return f"""
+        <style>
+            body {{ font-family: 'Segoe UI', sans-serif; color: #e0e0e0; margin: 0; }}
+            p {{ margin-bottom: 10px; margin-top: 0; }}
+            a {{ color: #4facfe; }}
+            pre {{
+                background-color: #272822;
+                padding: 12px;
+                border-radius: 6px;
+                border: 1px solid #444;
+                overflow-x: auto;
+                margin: 8px 0;
+                line-height: 1.2;
+            }}
+            pre * {{ margin: 0; padding: 0; }}
+            code {{ font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; }}
+            p code {{ background-color: #3e3e3e; padding: 2px 5px; border-radius: 4px; }}
+            {pygments_css}
+        </style>
+        {html_content}
+        """
 
     def adjust_height_to_content(self):
         """
@@ -456,14 +489,16 @@ class MainWindow(PrivacyWindow):
         QTimer.singleShot(50, self.adjust_height_to_content)
         self.move(20, 50)
         self._unregister_dynamic_hotkey(201)
-        print("App reset")
+        logger.info("App reset")
 
     def _toggle_visibility(self):
         if self.isVisible():
             self.hide()
+            logger.debug("Window hidden")
         else:
             self.show()
             self.setAttribute(_WA.WA_ShowWithoutActivating)
+            logger.debug("Window shown")
 
     def _toggle_privacy(self):
         self.privacy_enabled = not self.privacy_enabled
@@ -494,23 +529,23 @@ class MainWindow(PrivacyWindow):
         api_key = self.settings.get_api_key(provider_name)
 
         if not api_key:
-            print(f"⚠ No API key found for {provider_name}")
+            logger.warning(f"No API key found for {provider_name}")
             self._prompt_for_api_key(provider_name)
             return
 
         try:
             if provider_name == "gemini":
-                model = self.settings.get("llm.gemini_model", "gemini-2.5-flash-lite")
-                print(f"Using Gemini model: {model}")
+                model = self.settings.get("llm.gemini_model", "gemini-3.1-flash-lite-preview")
+                logger.info(f"Initializing Gemini provider with model: {model}")
                 self.llm_provider = SmartGeminiProvider(api_key, model)
             elif provider_name == "claude":
                 model = self.settings.get("llm.claude_model", "claude-3-5-sonnet-20241022")
-                print(f"Using Claude model: {model}")
+                logger.info(f"Initializing Claude provider with model: {model}")
                 self.llm_provider = ClaudeProvider(api_key, model)
             else:
-                print(f"Unknown provider: {provider_name}")
+                logger.error(f"Unknown provider: {provider_name}")
         except Exception as e:
-            print(f"Error initializing LLM provider: {e}")
+            logger.error(f"Error initializing LLM provider: {e}", exc_info=True)
             msg = QMessageBox(self)
             msg.setWindowTitle("LLM Error")
             msg.setText(f"Failed to initialize {provider_name}: {e}")
