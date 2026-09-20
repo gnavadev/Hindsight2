@@ -9,24 +9,46 @@ Combines all UI components into the main application window with:
 """
 
 import logging
+import sys
 import time
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QWidget, QMessageBox, QInputDialog,
-    QTextBrowser, QSizePolicy, QLineEdit
+    QTextBrowser, QSizePolicy, QLineEdit, QApplication
 )
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QTimer, QThread, QObject, Signal
 from PySide6.QtGui import QKeySequence, QShortcut, QPalette, QColor, QDesktopServices
-import ctypes
 import markdown
 from pygments.formatters import HtmlFormatter
-from ctypes import wintypes
-from ui.privacy_window import PrivacyWindow
+from ui.privacy_window import PrivacyWindow, exclude_widget_from_capture
 from config.settings import Settings
-from llm.gemini_provider import GeminiProvider
-from llm.smart_provider import SmartGeminiProvider
-from llm.claude_provider import ClaudeProvider
+from llm.smart_provider import SmartProvider, SmartGeminiProvider
+from utils.hotkeys import chord_label, create_hotkey_manager, platform_mod
+from utils.logging_setup import set_debug_logging
 
 logger = logging.getLogger(__name__)
+
+
+class _LlmSendWorker(QObject):
+    """Runs the blocking LLM call off the UI thread so the overlay can paint."""
+
+    finished = Signal(object, float, int)
+    failed = Signal(str, float, int)
+
+    def __init__(self, provider, text, images):
+        super().__init__()
+        self._provider = provider
+        self._text = text
+        self._images = images
+
+    def run(self):
+        n = len(self._images)
+        t0 = time.time()
+        try:
+            result = self._provider.send_message(text=self._text, images=self._images)
+            self.finished.emit(result, time.time() - t0, n)
+        except Exception as e:
+            logger.error(f"LLM send failed: {e}", exc_info=True)
+            self.failed.emit(str(e), time.time() - t0, n)
 
 # ------------------------
 # PySide6 v6 enum aliases
@@ -58,6 +80,8 @@ class MainWindow(PrivacyWindow):
         # 2. Transparency and click-through
         self.setAttribute(_WA.WA_TranslucentBackground)
         self.setAttribute(_WA.WA_ShowWithoutActivating)
+        if sys.platform == "darwin":
+            self.setAttribute(_WA.WA_MacAlwaysShowToolWindow, True)
         self.setWindowOpacity(0.85)
         self.set_click_through(True)
 
@@ -67,8 +91,14 @@ class MainWindow(PrivacyWindow):
         # Load settings
         self.settings = Settings()
 
-        # Privacy state
+        # Privacy / debug state
         self.privacy_enabled = True
+        self.debug_mode = False
+        self.current_images = []
+        self._max_pages = 8
+        self._send_in_progress = False
+        self._llm_thread = None
+        self._llm_worker = None
 
         # Initialize LLM provider
         self.llm_provider = None
@@ -79,7 +109,7 @@ class MainWindow(PrivacyWindow):
         self._setup_ui()
 
         # Native Hotkeys
-        self.hotkey_ids = {}
+        self._hotkeys = None
         self._setup_global_hotkeys()
 
         logger.info("Overlay initialized")
@@ -179,11 +209,11 @@ class MainWindow(PrivacyWindow):
         row2_layout.setAlignment(_AF.AlignLeft)
 
         shortcuts = [
-            ("Ctrl+H", "Screenshot"),
-            ("Ctrl+R", "Reset"),
-            ("Ctrl+B", "Hide/Show"),
-            ("Ctrl+P", "Privacy"),
-            ("Ctrl+Arrows", "Move"),
+            (chord_label("H"), "Screenshot / add page"),
+            (chord_label("R"), "Reset"),
+            (chord_label("B"), "Hide/Show"),
+            (chord_label("P"), "Privacy / Debug"),
+            (chord_label("Arrows"), "Move"),
         ]
 
         for i, (keys, desc) in enumerate(shortcuts):
@@ -200,14 +230,15 @@ class MainWindow(PrivacyWindow):
         legend_layout.addLayout(row2_layout)
         container_layout.addWidget(legend_widget)
 
-        # 2. Image preview (hidden by default)
-        self.image_preview_label = QLabel()
-        self.image_preview_label.setAlignment(_AF.AlignCenter)
-        self.image_preview_label.setStyleSheet(
-            "background: transparent; border: 1px solid #444; border-radius: 4px;"
-        )
-        self.image_preview_label.hide()
-        container_layout.addWidget(self.image_preview_label)
+        # 2. Image preview strip (hidden by default; holds 1..N page thumbs)
+        self.preview_container = QWidget()
+        self.preview_container.setStyleSheet("background: transparent;")
+        self.preview_layout = QHBoxLayout(self.preview_container)
+        self.preview_layout.setContentsMargins(0, 2, 0, 2)
+        self.preview_layout.setSpacing(6)
+        self.preview_layout.setAlignment(_AF.AlignLeft)
+        self.preview_container.hide()
+        container_layout.addWidget(self.preview_container)
 
         # 3. Response viewer
         self.response_viewer = QTextBrowser()
@@ -244,69 +275,50 @@ class MainWindow(PrivacyWindow):
     # ------------------------------------------------------------------
 
     def _setup_global_hotkeys(self):
-        """Register global system-wide hotkeys via user32.dll"""
-        self.user32 = ctypes.windll.user32
-
-        MOD_CONTROL = 0x0002
-        VK_H, VK_B, VK_P, VK_R   = 0x48, 0x42, 0x50, 0x52
-        VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN = 0x25, 0x26, 0x27, 0x28
-        VK_ENTER = 0x0D
-        step = 30
-
-        self.hotkeys = {
-            101: (MOD_CONTROL, VK_H,     self._handle_screenshot),
-            102: (MOD_CONTROL, VK_B,     self._toggle_visibility),
-            103: (MOD_CONTROL, VK_P,     self._toggle_privacy),
-            104: (MOD_CONTROL, VK_UP,    lambda: self.move_window(0, -step)),
-            105: (MOD_CONTROL, VK_DOWN,  lambda: self.move_window(0,  step)),
-            106: (MOD_CONTROL, VK_LEFT,  lambda: self.move_window(-step, 0)),
-            107: (MOD_CONTROL, VK_RIGHT, lambda: self.move_window( step, 0)),
-            108: (MOD_CONTROL, VK_R,     self._handle_reset),
-        }
-
-        self.dynamic_hotkeys = {
-            201: (MOD_CONTROL, VK_ENTER, self._handle_send),
-        }
+        """Register global system-wide hotkeys (Windows RegisterHotKey / macOS Carbon)."""
+        self._hotkeys = create_hotkey_manager(self)
         self.registered_dynamic_ids = set()
+        from PySide6.QtCore import QTimer
+        step = 30
+        mod = platform_mod()
 
-        hwnd = int(self.winId())
-        for hk_id, (mod, vk, _) in self.hotkeys.items():
-            if self.user32.RegisterHotKey(hwnd, hk_id, mod, vk):
-                self.hotkey_ids[hk_id] = self.hotkeys[hk_id][2]
-                logger.debug(f"Registered hotkey ID {hk_id}")
-            else:
-                logger.warning(f"Failed to register hotkey ID {hk_id}")
+        def invoke(cb):
+            return lambda: QTimer.singleShot(0, cb)
+
+        bindings = [
+            (101, mod, "h", invoke(self._handle_screenshot)),
+            (102, mod, "b", invoke(self._toggle_visibility)),
+            (103, mod, "p", invoke(self._toggle_privacy)),
+            (104, mod, "up", invoke(lambda: self.move_window(0, -step))),
+            (105, mod, "down", invoke(lambda: self.move_window(0, step))),
+            (106, mod, "left", invoke(lambda: self.move_window(-step, 0))),
+            (107, mod, "right", invoke(lambda: self.move_window(step, 0))),
+            (108, mod, "r", invoke(self._handle_reset)),
+        ]
+        for hk_id, m, key, cb in bindings:
+            self._hotkeys.register(hk_id, m, key, cb)
 
     def _register_dynamic_hotkey(self, hk_id):
-        if hk_id in self.registered_dynamic_ids or hk_id not in self.dynamic_hotkeys:
+        if hk_id in self.registered_dynamic_ids or self._hotkeys is None:
             return
-        mod, vk, func = self.dynamic_hotkeys[hk_id]
-        if self.user32.RegisterHotKey(int(self.winId()), hk_id, mod, vk):
-            self.hotkey_ids[hk_id] = func
-            self.registered_dynamic_ids.add(hk_id)
-            logger.debug(f"Registered dynamic hotkey ID {hk_id}")
-        else:
-            logger.warning(f"Failed to register dynamic hotkey ID {hk_id}")
+        if hk_id == 201:
+            from PySide6.QtCore import QTimer
+            if self._hotkeys.register(
+                201, platform_mod(), "enter", lambda: QTimer.singleShot(0, self._handle_send)
+            ):
+                self.registered_dynamic_ids.add(hk_id)
 
     def _unregister_dynamic_hotkey(self, hk_id):
-        if hk_id not in self.registered_dynamic_ids:
+        if hk_id not in self.registered_dynamic_ids or self._hotkeys is None:
             return
-        if self.user32.UnregisterHotKey(int(self.winId()), hk_id):
-            self.hotkey_ids.pop(hk_id, None)
-            self.registered_dynamic_ids.discard(hk_id)
-            logger.debug(f"Unregistered dynamic hotkey ID {hk_id}")
+        self._hotkeys.unregister(hk_id)
+        self.registered_dynamic_ids.discard(hk_id)
 
     def nativeEvent(self, event_type, message):
-        try:
-            if event_type == b'windows_generic_MSG':
-                msg = wintypes.MSG.from_address(message.__int__())
-                if msg.message == 0x0312:  # WM_HOTKEY
-                    hk_id = msg.wParam
-                    if hk_id in self.hotkey_ids:
-                        self.hotkey_ids[hk_id]()
-                        return True, 0
-        except Exception as e:
-            logger.error(f"Error in nativeEvent: {e}", exc_info=True)
+        if self._hotkeys is not None:
+            handled = self._hotkeys.handle_native_event(event_type, message)
+            if handled is not None:
+                return handled
         return super().nativeEvent(event_type, message)
 
     def _setup_shortcuts(self):
@@ -323,44 +335,53 @@ class MainWindow(PrivacyWindow):
             from PySide6.QtWidgets import QApplication
             import time as _time
 
+            if len(self.current_images) >= self._max_pages:
+                self.response_viewer.setHtml(
+                    f"Already have {self._max_pages} pages. "
+                    f"<b>{chord_label('Enter')}</b> to send or "
+                    f"<b>{chord_label('R')}</b> to reset."
+                )
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(50, self.adjust_height_to_content)
+                return
+
             geo = self.geometry()
             center_x = geo.x() + geo.width() // 2
             center_y = geo.y() + geo.height() // 2
 
+            # Hide overlay so it cannot leak into the captured page
+            prev_privacy = self.privacy_enabled
             self.set_privacy_mode(False)
             prev_pos = self.pos()
             self.move(-10000, -10000)
             self.hide()
 
             QApplication.processEvents()
-            _time.sleep(0.5)
+            _time.sleep(0.35)
             QApplication.processEvents()
 
-            self.current_image = capture_screenshot((center_x, center_y))
+            shot = capture_screenshot((center_x, center_y))
 
+            self._privacy_enabled = prev_privacy
             self.move(prev_pos)
             self.show()
             self.setAttribute(_WA.WA_ShowWithoutActivating)
-            self.set_privacy_mode(True)  # re-enable after screenshot
+            self.set_privacy_mode(prev_privacy)
 
-            if self.current_image:
-                from PySide6.QtGui import QPixmap
-                import io
-                buf = io.BytesIO()
-                self.current_image.save(buf, format='PNG')
-                pixmap = QPixmap()
-                pixmap.loadFromData(buf.getvalue())
-                self.image_preview_label.setPixmap(
-                    pixmap.scaledToHeight(100, _TM.SmoothTransformation)
-                )
-                self.image_preview_label.show()
-                self.response_viewer.setText(
-                    "Screenshot captured!\nPress <b>Ctrl+Enter</b> to send."
+            if shot:
+                self.current_images.append(shot)
+                self._refresh_image_previews()
+                n = len(self.current_images)
+                self.response_viewer.setHtml(
+                    f"<b>{n}</b> page{'s' if n != 1 else ''} captured. "
+                    f"<b>{chord_label('H')}</b> add another · "
+                    f"<b>{chord_label('Enter')}</b> send all · "
+                    f"<b>{chord_label('R')}</b> reset"
                 )
                 from PySide6.QtCore import QTimer
                 QTimer.singleShot(50, self.adjust_height_to_content)
                 self._register_dynamic_hotkey(201)
-                logger.info("Screenshot captured and preview shown")
+                logger.info(f"Screenshot captured ({n}/{self._max_pages})")
             else:
                 logger.warning("Screenshot capture returned None")
                 self.response_viewer.setText("Screenshot failed — check logs.")
@@ -369,48 +390,134 @@ class MainWindow(PrivacyWindow):
             logger.error(f"Screenshot error: {e}", exc_info=True)
             self.response_viewer.setText(f"Screenshot error: {e}")
 
+    def _refresh_image_previews(self):
+        """Rebuild the thumbnail strip from current_images."""
+        from PySide6.QtGui import QPixmap
+        import io
+
+        while self.preview_layout.count():
+            item = self.preview_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        if not self.current_images:
+            self.preview_container.hide()
+            return
+
+        for i, img in enumerate(self.current_images):
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            pixmap = QPixmap()
+            pixmap.loadFromData(buf.getvalue())
+            thumb = QLabel()
+            thumb.setPixmap(pixmap.scaledToHeight(88, _TM.SmoothTransformation))
+            thumb.setToolTip(f"Page {i + 1} of {len(self.current_images)}")
+            thumb.setStyleSheet(
+                "background: transparent; border: 1px solid #555; border-radius: 4px;"
+            )
+            badge = QLabel(f"{i + 1}", thumb)
+            badge.setStyleSheet(
+                "color: #fff; background: rgba(0,0,0,180); font-size: 9px; "
+                "padding: 1px 4px; border-radius: 3px;"
+            )
+            badge.move(4, 4)
+            badge.adjustSize()
+            self.preview_layout.addWidget(thumb)
+
+        self.preview_layout.addStretch()
+        self.preview_container.show()
+
     def _handle_send(self):
-        if not hasattr(self, 'current_image') or not self.current_image:
-            logger.debug("_handle_send called but no current_image available")
+        if not self.current_images:
+            logger.debug("_handle_send called but no images queued")
+            return
+        if self._send_in_progress:
+            logger.debug("_handle_send ignored — request already in flight")
+            return
+
+        if not self.llm_provider:
+            logger.warning("LLM provider not configured")
+            self.response_viewer.setText("LLM not configured.")
             return
 
         self._unregister_dynamic_hotkey(201)
-        self.image_preview_label.hide()
-        self.response_viewer.setHtml("Sending to LLM...")
-
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(50, self.adjust_height_to_content)
+        images = list(self.current_images)
+        n = len(images)
+        self.preview_container.hide()
+        pages = "page" if n == 1 else "pages"
+        self.response_viewer.setHtml(
+            f"Sending {n} {pages} to LLM…"
+            f"<br><span style='color:#888'>Waiting for response</span>"
+        )
+        self.adjust_height_to_content()
         self.repaint()
+        QApplication.processEvents()
 
-        if self.llm_provider:
-            send_start = time.time()
-            try:
-                logger.info("Sending image to LLM provider...")
-                response = self.llm_provider.send_message(
-                    text="Analyze this image.",
-                    images=[self.current_image]
-                )
-                elapsed = time.time() - send_start
-                logger.info(f"LLM response received in {elapsed:.1f}s")
-
-                text_response = response.get('response', 'No response')
-
-                # Log metadata if available
-                metadata = response.get('metadata', {})
-                if metadata:
-                    logger.debug(f"Response metadata: model={metadata.get('model')}, timing={metadata.get('timing')}")
-
-                styled_html = self._render_markdown_to_html(text_response)
-                self.response_viewer.setHtml(styled_html)
-                QTimer.singleShot(100, self.adjust_height_to_content)
-
-            except Exception as e:
-                elapsed = time.time() - send_start
-                logger.error(f"LLM send failed after {elapsed:.1f}s: {e}", exc_info=True)
-                self.response_viewer.setText(f"Error: {e}")
+        if n > 1:
+            text = (
+                f"These {n} images are sequential pages of the same problem. "
+                "Use every page together as one context."
+            )
         else:
-            logger.warning("LLM provider not configured")
-            self.response_viewer.setText("LLM not configured.")
+            text = "Analyze this image."
+
+        self._send_in_progress = True
+        thread = QThread(self)
+        worker = _LlmSendWorker(self.llm_provider, text, images)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_llm_finished)
+        worker.failed.connect(self._on_llm_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._llm_thread = thread
+        self._llm_worker = worker
+        logger.info(f"Sending {n} image(s) to LLM provider...")
+        thread.start()
+
+    def _on_llm_finished(self, response, elapsed, n):
+        self._send_in_progress = False
+        logger.info(f"LLM response received in {elapsed:.1f}s")
+        text_response = (response or {}).get("response", "No response")
+        metadata = (response or {}).get("metadata", {}) or {}
+        logger.debug(
+            f"Response metadata: model={metadata.get('model')}, "
+            f"timing={metadata.get('timing')}, usage={metadata.get('usage')}"
+        )
+        if self.debug_mode:
+            text_response = self._append_debug_hud(text_response, metadata, n, elapsed)
+        self.response_viewer.setHtml(self._render_markdown_to_html(text_response))
+        QTimer.singleShot(100, self.adjust_height_to_content)
+
+    def _on_llm_failed(self, error, elapsed, n):
+        self._send_in_progress = False
+        logger.error(f"LLM send failed after {elapsed:.1f}s: {error}")
+        self.response_viewer.setText(f"Error: {error}")
+        self.preview_container.show()
+        self._register_dynamic_hotkey(201)
+        QTimer.singleShot(50, self.adjust_height_to_content)
+
+    @staticmethod
+    def _append_debug_hud(text: str, metadata: dict, image_count: int, elapsed: float) -> str:
+        usage = metadata.get("usage") or {}
+        timing = metadata.get("timing") or {}
+        bits = [
+            f"model={metadata.get('model', '?')}",
+            f"pages={image_count}",
+            f"time={elapsed:.1f}s",
+        ]
+        if timing.get("requests"):
+            bits.append(f"requests={timing['requests']}")
+        if usage:
+            bits.append(
+                f"tokens in={usage.get('input_tokens', '?')} "
+                f"out={usage.get('output_tokens', '?')} "
+                f"total={usage.get('total_tokens', '?')}"
+            )
+        return text.rstrip() + "\n\n---\n**debug:** `" + " · ".join(bits) + "`"
 
     def _render_markdown_to_html(self, md_text: str) -> str:
         """Convert markdown text to styled HTML for the response viewer."""
@@ -458,6 +565,8 @@ class MainWindow(PrivacyWindow):
         screen    = self.screen().availableGeometry()
         max_width = screen.width() // 2
         overhead  = 60  # legend bar + layout margins
+        if self.preview_container.isVisible():
+            overhead += max(96, self.preview_container.sizeHint().height())
 
         # Always use max width so content wraps as little as possible
         self.response_viewer.document().setTextWidth(max_width - 40)
@@ -473,17 +582,12 @@ class MainWindow(PrivacyWindow):
 
     @staticmethod
     def _apply_privacy(widget: QWidget):
-        """Apply WDA_EXCLUDEFROMCAPTURE to any top-level widget (dialogs, etc.)"""
-        import ctypes
-        hwnd = int(widget.winId())
-        if hwnd:
-            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+        """Exclude any top-level widget (dialogs, etc.) from capture."""
+        exclude_widget_from_capture(widget, True)
 
     def _handle_reset(self):
-        if hasattr(self, 'current_image'):
-            del self.current_image
-        self.image_preview_label.clear()
-        self.image_preview_label.hide()
+        self.current_images.clear()
+        self._refresh_image_previews()
         self.response_viewer.setHtml("Listening...")
         from PySide6.QtCore import QTimer
         QTimer.singleShot(50, self.adjust_height_to_content)
@@ -501,18 +605,32 @@ class MainWindow(PrivacyWindow):
             logger.debug("Window shown")
 
     def _toggle_privacy(self):
-        self.privacy_enabled = not self.privacy_enabled
+        # Privacy off == debug on: overlay is visible in screenshots / share
+        self.set_debug_mode(self.privacy_enabled)
+
+    def set_debug_mode(self, enabled: bool):
+        """
+        Debug mode:
+        - Overlay IS visible in screenshots and screen share
+        - Console logs at DEBUG
+        - Response HUD shows model / tokens / timing
+        """
+        self.debug_mode = enabled
+        self.privacy_enabled = not enabled
         self.set_privacy_mode(self.privacy_enabled)
+        set_debug_logging(enabled)
         if self.privacy_enabled:
             self.status_label.setText("⬤")
             self.status_label.setStyleSheet(
                 "color: #00ffca; font-size: 8px; background: transparent; padding: 2px;"
             )
+            logger.info("Privacy ON — hidden from screenshots / screen share")
         else:
             self.status_label.setText("◯")
             self.status_label.setStyleSheet(
                 "color: #ff4444; font-size: 8px; background: transparent; padding: 2px;"
             )
+            logger.info("DEBUG MODE — overlay is visible in screenshots / screen share")
         self.status_label.adjustSize()
         self.resizeEvent(None)
 
@@ -525,7 +643,7 @@ class MainWindow(PrivacyWindow):
     # ------------------------------------------------------------------
 
     def _init_llm_provider(self):
-        provider_name = self.settings.get("llm.provider", "gemini")
+        provider_name = self.settings.get("llm.provider", "zai")
         api_key = self.settings.get_api_key(provider_name)
 
         if not api_key:
@@ -539,9 +657,18 @@ class MainWindow(PrivacyWindow):
                 logger.info(f"Initializing Gemini provider with model: {model}")
                 self.llm_provider = SmartGeminiProvider(api_key, model)
             elif provider_name == "claude":
+                from llm.claude_provider import ClaudeProvider
                 model = self.settings.get("llm.claude_model", "claude-3-5-sonnet-20241022")
                 logger.info(f"Initializing Claude provider with model: {model}")
-                self.llm_provider = ClaudeProvider(api_key, model)
+                self.llm_provider = SmartProvider(ClaudeProvider(api_key, model))
+            elif provider_name in ("zai", "z.ai", "z_ai"):
+                from llm.zai_provider import ZaiProvider
+                model = self.settings.get("llm.zai_model", "glm-5.3-flash")
+                effort = self.settings.get("llm.zai_reasoning_effort", "high")
+                logger.info(f"Initializing Z.AI provider with model: {model}")
+                self.llm_provider = SmartProvider(
+                    ZaiProvider(api_key, model, reasoning_effort=effort)
+                )
             else:
                 logger.error(f"Unknown provider: {provider_name}")
         except Exception as e:

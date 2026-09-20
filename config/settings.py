@@ -39,12 +39,28 @@ class Settings:
         load_dotenv(override=True)
 
         # Override Settings with Environment Variables
+        if "llm" not in self.settings:
+            self.settings["llm"] = {}
+
+        env_provider = os.getenv("LLM_PROVIDER")
+        if env_provider:
+            self.settings["llm"]["provider"] = env_provider.strip().lower()
+            logger.debug(f"LLM_PROVIDER override from env: {env_provider}")
+
         env_model = os.getenv("GEMINI_MODEL")
         if env_model:
-            if "llm" not in self.settings:
-                self.settings["llm"] = {}
             self.settings["llm"]["gemini_model"] = env_model
             logger.debug(f"GEMINI_MODEL override from env: {env_model}")
+
+        zai_model = os.getenv("ZAI_MODEL")
+        if zai_model:
+            self.settings["llm"]["zai_model"] = zai_model
+            logger.debug(f"ZAI_MODEL override from env: {zai_model}")
+
+        zai_effort = os.getenv("ZAI_REASONING_EFFORT")
+        if zai_effort:
+            self.settings["llm"]["zai_reasoning_effort"] = zai_effort
+            logger.debug(f"ZAI_REASONING_EFFORT override from env: {zai_effort}")
 
     def _get_cipher(self) -> Fernet:
         """Get or create encryption cipher"""
@@ -78,11 +94,14 @@ class Settings:
         """Get default settings"""
         return {
             "llm": {
-                "provider": "gemini",  # or "claude"
+                "provider": "zai",  # zai | gemini | claude
                 "gemini_api_key_encrypted": None,
                 "claude_api_key_encrypted": None,
+                "zai_api_key_encrypted": None,
                 "gemini_model": "gemini-3.1-flash-lite-preview",
-                "claude_model": "claude-3-5-sonnet-20241022"
+                "claude_model": "claude-3-5-sonnet-20241022",
+                "zai_model": "glm-5.3-flash",
+                "zai_reasoning_effort": "high",
             },
             "ui": {
                 "theme": "dark",
@@ -133,6 +152,9 @@ class Settings:
 
     def get_api_key(self, provider: str) -> Optional[str]:
         """Get an API key (prioritizing Environment Variables over config)"""
+        aliases = {"z.ai": "zai", "z_ai": "zai"}
+        provider = aliases.get(provider, provider)
+
         # 1. Try Environment Variable first (allows .env to override broken configs)
         env_key = os.getenv(f"{provider.upper()}_API_KEY")
         if env_key:
