@@ -30,7 +30,7 @@ def kwin_rules():
             from utils.kwin_window import KWinWindowRules, kwin_wayland_available
             if kwin_wayland_available():
                 try:
-                    _kwin_rules = KWinWindowRules("")
+                    _kwin_rules = KWinWindowRules()
                 except Exception as e:
                     logger.error(f"KWin window control unavailable: {e}")
             else:
@@ -89,12 +89,9 @@ def exclude_widget_from_capture(widget: QWidget, enabled: bool) -> bool:
         return set_sharing_type(widget, enabled)
     rules = kwin_rules()
     if rules is not None:
-        # One process-wide flag that covers every window we own, dialogs
-        # included; only the overlay's privacy toggle changes it.
-        if isinstance(widget, PrivacyWindow):
-            rules.caption = widget.windowTitle()
-            return rules.set_exclude_from_capture(enabled)
-        return True
+        # One process-wide flag covers every window we own (overlay, notes
+        # panel, dialogs); only the overlay's privacy toggle changes it.
+        return rules.set_exclude_from_capture(enabled)
     logger.debug("Capture exclusion is not available on this platform")
     return False
 
@@ -171,15 +168,16 @@ class PrivacyWindow(QWidget):
 
     def overlay_pos(self) -> QPoint:
         rules = kwin_rules()
-        if rules is not None and rules.position is not None:
-            return QPoint(*rules.position)
+        if rules is not None:
+            pos = rules.window_position(self.windowTitle())
+            if pos is not None:
+                return QPoint(*pos)
         return self.pos()
 
     def move_overlay(self, x: int, y: int):
         rules = kwin_rules()
         if rules is not None:
-            rules.caption = self.windowTitle()
-            rules.set_position(x, y)
+            rules.set_window_position(self.windowTitle(), x, y)
         else:
             self.move(x, y)
 

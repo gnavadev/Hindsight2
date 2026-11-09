@@ -42,6 +42,9 @@ _DESCRIPTIONS = {
     "r": "Reset",
     "q": "Quit Hindsight",
     "]": "Record PC audio (start / stop)",
+    "o": "Open / close notes panel",
+    "w": "Previous notes page",
+    "s": "Next notes page",
     "up": "Move overlay up",
     "down": "Move overlay down",
     "left": "Move overlay left",
@@ -58,6 +61,10 @@ _KEYSYMS = {
     "r": "r",
     "q": "q",
     "]": "bracketright",
+    "o": "o",
+    "w": "w",
+    "a": "a",
+    "s": "s",
     "up": "Up",
     "down": "Down",
     "left": "Left",
@@ -580,14 +587,21 @@ class X11Hotkeys:
                 logger.error(f"X11 hotkey loop error: {e}", exc_info=True)
 
 
+def _desktop_arg(p: str) -> str:
+    """Quote a path for a .desktop Exec line (double quotes, per the spec —
+    shell single-quotes are not valid there, and our path has a space)."""
+    for ch in ("\\", '"', "`", "$"):
+        p = p.replace(ch, "\\" + ch)
+    return f'"{p}"'
+
+
 def _launch_command() -> str:
-    import shlex
     import sys
 
     if getattr(sys, "frozen", False):  # PyInstaller build
-        return shlex.quote(os.path.abspath(sys.executable))
+        return _desktop_arg(os.path.abspath(sys.executable))
     main = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
-    return " ".join(shlex.quote(p) for p in (sys.executable, main) if p)
+    return " ".join(_desktop_arg(p) for p in (sys.executable, main) if p)
 
 
 def ensure_desktop_entry() -> None:

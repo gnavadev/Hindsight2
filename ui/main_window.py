@@ -170,6 +170,7 @@ class MainWindow(PrivacyWindow):
         self._send_in_progress = False
         self._llm_thread = None
         self._llm_worker = None
+        self.pdf_panel = None  # notes reader beside the overlay (created on first use)
 
         # Initialize LLM provider
         self.llm_provider = None
@@ -290,8 +291,10 @@ class MainWindow(PrivacyWindow):
             (chord_label("P"), "Privacy / Debug"),
             (chord_label("Arrows"), "Move"),
             (chord_label("]"), "Record PC audio"),
+            (chord_label("O"), "Notes (PDF)"),
             (chord_label("Shift+Q"), "Quit"),
         ]
+        split = (len(shortcuts) + 1) // 2
 
         for i, (keys, desc) in enumerate(shortcuts):
             lbl = QLabel(
@@ -299,7 +302,7 @@ class MainWindow(PrivacyWindow):
                 f"<span style='color: #888;'>{desc}</span>"
             )
             lbl.setStyleSheet("font-size: 9px; margin: 0px; padding: 0px;")
-            (row1_layout if i < 3 else row2_layout).addWidget(lbl)
+            (row1_layout if i < split else row2_layout).addWidget(lbl)
 
         row1_layout.addStretch()
         row2_layout.addStretch()
@@ -373,11 +376,26 @@ class MainWindow(PrivacyWindow):
             (108, mod, "r", invoke(self._handle_reset)),
             (109, f"{mod}+shift", "q", invoke(self._quit_app)),
             (110, mod, "]", invoke(self._toggle_recording)),
+            (111, mod, "o", invoke(self._toggle_pdf_panel)),
         ]
         # Ctrl+Arrows keep moving the overlay while held
         repeating = {104, 105, 106, 107}
         for hk_id, m, key, cb in bindings:
             self._hotkeys.register(hk_id, m, key, cb, repeat=hk_id in repeating)
+
+        # Dynamic hotkeys: registered only while they apply, so their keys stay
+        # free for other apps otherwise. (mod, key, callback, repeat-while-held)
+        self._dynamic = {
+            201: (mod, "enter", self._handle_send, False),       # while pages/audio queued
+            # --- while the notes panel is open ---
+            202: (mod, "w", self._pdf_prev_page, False),   # single press per page
+            203: (mod, "s", self._pdf_next_page, False),
+            204: (f"{mod}+shift", "up", lambda: self._move_pdf_panel(0, -step), True),
+            205: (f"{mod}+shift", "down", lambda: self._move_pdf_panel(0, step), True),
+            206: (f"{mod}+shift", "left", lambda: self._move_pdf_panel(-step, 0), True),
+            207: (f"{mod}+shift", "right", lambda: self._move_pdf_panel(step, 0), True),
+        }
+        self._pdf_hotkey_ids = (202, 203, 204, 205, 206, 207)
 
     def _quit_app(self):
         logger.info("Quit requested via hotkey")
@@ -388,12 +406,15 @@ class MainWindow(PrivacyWindow):
     def _register_dynamic_hotkey(self, hk_id):
         if hk_id in self.registered_dynamic_ids or self._hotkeys is None:
             return
-        if hk_id == 201:
-            from PySide6.QtCore import QTimer
-            if self._hotkeys.register(
-                201, platform_mod(), "enter", lambda: QTimer.singleShot(0, self._handle_send)
-            ):
-                self.registered_dynamic_ids.add(hk_id)
+        spec = self._dynamic.get(hk_id)
+        if spec is None:
+            return
+        mod, key, cb, repeat = spec
+        from PySide6.QtCore import QTimer
+        if self._hotkeys.register(
+            hk_id, mod, key, lambda cb=cb: QTimer.singleShot(0, cb), repeat=repeat
+        ):
+            self.registered_dynamic_ids.add(hk_id)
 
     def _unregister_dynamic_hotkey(self, hk_id):
         if hk_id not in self.registered_dynamic_ids or self._hotkeys is None:
@@ -847,6 +868,74 @@ class MainWindow(PrivacyWindow):
     def move_window(self, dx, dy):
         pos = self.overlay_pos()
         self.move_overlay(pos.x() + dx, pos.y() + dy)
+        # Notes panel travels with the overlay, keeping whatever relative
+        # offset the user set with Ctrl+Shift+Arrows.
+        if self.pdf_panel is not None and self.pdf_panel.isVisible():
+            self._move_pdf_panel(dx, dy)
+
+    # ------------------------------------------------------------------
+    # Notes panel (PDF reader beside the overlay)
+    # ------------------------------------------------------------------
+
+    def _toggle_pdf_panel(self):
+        if self.pdf_panel is None:
+            from ui.pdf_panel import PdfPanel
+            self.pdf_panel = PdfPanel()
+        if self.pdf_panel.isVisible():
+            self._close_pdf_panel()
+            return
+        self._position_pdf_panel()
+        self.pdf_panel.show()
+        self.pdf_panel.setAttribute(_WA.WA_ShowWithoutActivating)
+        self.pdf_panel.set_privacy_mode(self.privacy_enabled)
+        # Scroll (Ctrl+W/A) and move (Ctrl+Shift+Arrows) keys for the notes;
+        # only grabbed while the panel is open so they stay free otherwise.
+        for hk_id in self._pdf_hotkey_ids:
+            self._register_dynamic_hotkey(hk_id)
+        logger.info("Notes panel opened")
+
+    def _close_pdf_panel(self):
+        if self.pdf_panel is not None:
+            self.pdf_panel.hide()
+        for hk_id in self._pdf_hotkey_ids:
+            self._unregister_dynamic_hotkey(hk_id)
+        logger.info("Notes panel closed")
+
+    def _position_pdf_panel(self):
+        """Place the panel beside the overlay (to the right, else to the left)."""
+        if self.pdf_panel is None:
+            return
+        from ui.privacy_window import primary_screen
+        screen = primary_screen().geometry()
+        gap = 16
+        max_overlay_w = min(screen.width() // 2, 760)  # the overlay's own cap
+        ov = self.overlay_pos()
+        pw = self.pdf_panel.width()
+        ph = self.pdf_panel.height()
+
+        # Anchor to a fixed offset so the panel does not jump when the overlay
+        # grows/shrinks with content.
+        x = ov.x() + max_overlay_w + gap
+        if x + pw > screen.x() + screen.width():
+            x = ov.x() - pw - gap  # no room on the right
+        x = max(screen.x(), min(x, screen.x() + screen.width() - pw))
+        y = max(screen.y(), min(ov.y(), screen.y() + screen.height() - ph))
+        self.pdf_panel.move_overlay(x, y)
+
+    def _pdf_prev_page(self):
+        if self.pdf_panel is not None:
+            self.pdf_panel.prev_page()
+
+    def _pdf_next_page(self):
+        if self.pdf_panel is not None:
+            self.pdf_panel.next_page()
+
+    def _move_pdf_panel(self, dx, dy):
+        """Move the notes panel on its own (Ctrl+Shift+Arrows)."""
+        if self.pdf_panel is None or not self.pdf_panel.isVisible():
+            return
+        pos = self.pdf_panel.overlay_pos()
+        self.pdf_panel.move_overlay(pos.x() + dx, pos.y() + dy)
 
     # ------------------------------------------------------------------
     # LLM Init

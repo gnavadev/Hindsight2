@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import tempfile
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +32,7 @@ _KWIN_BUS = "org.kde.KWin"
 _SCRIPT = """
 const PID = %(pid)d;
 const EXCLUDE = %(exclude)s;
-const MAIN = %(caption)s;
-const POS = %(pos)s;
+const POS = %(positions)s;   // { "<window caption>": [x, y], ... }
 
 function apply(w) {
     if (!w || w.pid !== PID) return;
@@ -42,13 +41,14 @@ function apply(w) {
     w.skipPager = true;
     w.skipSwitcher = true;
     w.excludeFromCapture = EXCLUDE;
-    if (POS && w.caption === MAIN) {
+    const target = POS[w.caption];
+    if (target) {
         // KWin re-centers on-screen-display windows whenever they resize
-        // (the overlay grows when screenshots are added), so pin it.
+        // (the overlay grows when screenshots are added), so pin each one.
         const pin = () => {
             const g = w.frameGeometry;
-            if (Math.abs(g.x - POS[0]) > 0.5 || Math.abs(g.y - POS[1]) > 0.5)
-                w.frameGeometry = {x: POS[0], y: POS[1], width: g.width, height: g.height};
+            if (Math.abs(g.x - target[0]) > 0.5 || Math.abs(g.y - target[1]) > 0.5)
+                w.frameGeometry = {x: target[0], y: target[1], width: g.width, height: g.height};
         };
         w.frameGeometryChanged.connect(pin);
         pin();
@@ -91,15 +91,15 @@ def kwin_wayland_available() -> bool:
 
 
 class KWinWindowRules:
-    def __init__(self, main_caption: str):
+    def __init__(self):
         from jeepney.io.blocking import open_dbus_connection
 
         self._conn = open_dbus_connection(bus="SESSION")
         self._pid = os.getpid()
         self._name = f"hindsight-{self._pid}"
-        self.caption = main_caption
         self._exclude = True
-        self._pos: Optional[Tuple[int, int]] = None
+        # caption -> (x, y); one entry per window we position (overlay, panel…)
+        self._positions: Dict[str, Tuple[int, int]] = {}
         self._dir = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
         self._cleanup_stale()
         fd, self._path = tempfile.mkstemp(prefix="hindsight-kwin-", suffix=".js", dir=self._dir)
@@ -134,16 +134,22 @@ class KWinWindowRules:
 
     # -- settings ------------------------------------------------------
 
-    @property
-    def position(self) -> Optional[Tuple[int, int]]:
-        return self._pos
+    def window_position(self, caption: str) -> Optional[Tuple[int, int]]:
+        return self._positions.get(caption)
 
     def set_exclude_from_capture(self, enabled: bool) -> bool:
         self._exclude = enabled
         return self._reload()
 
-    def set_position(self, x: int, y: int) -> bool:
-        self._pos = (int(x), int(y))
+    def set_window_position(self, caption: str, x: int, y: int) -> bool:
+        if not caption:
+            return False
+        self._positions[caption] = (int(x), int(y))
+        return self._reload()
+
+    def forget_window(self, caption: str) -> bool:
+        if self._positions.pop(caption, None) is None:
+            return True
         return self._reload()
 
     # -- D-Bus ---------------------------------------------------------
@@ -161,8 +167,7 @@ class KWinWindowRules:
         src = _SCRIPT % {
             "pid": self._pid,
             "exclude": "true" if self._exclude else "false",
-            "caption": json.dumps(self.caption),
-            "pos": json.dumps(list(self._pos)) if self._pos else "null",
+            "positions": json.dumps({c: list(p) for c, p in self._positions.items()}),
         }
         try:
             with open(self._path, "w", encoding="utf-8") as f:
@@ -175,7 +180,8 @@ class KWinWindowRules:
                 raise RuntimeError("KWin refused to load the window script")
             self._call(f"/Scripting/Script{script_id}", "org.kde.kwin.Script", "run")
             logger.debug(
-                f"KWin rules applied: keepAbove, excludeFromCapture={self._exclude}, pos={self._pos}"
+                f"KWin rules applied: keepAbove, excludeFromCapture={self._exclude}, "
+                f"positions={self._positions}"
             )
             return True
         except Exception as e:

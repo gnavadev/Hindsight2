@@ -92,6 +92,10 @@ class _WinHotkeys(HotkeyManager):
         "r": 0x52,
         "q": 0x51,
         "]": 0xDD,  # VK_OEM_6
+        "o": 0x4F,
+        "w": 0x57,
+        "a": 0x41,
+        "s": 0x53,
         "left": 0x25,
         "up": 0x26,
         "right": 0x27,
@@ -185,6 +189,10 @@ class _MacHotkeys(HotkeyManager):
         "r": 0x0F,
         "q": 0x0C,
         "]": 0x1E,  # kVK_ANSI_RightBracket
+        "o": 0x1F,
+        "w": 0x0D,
+        "a": 0x00,
+        "s": 0x01,
         "left": 0x7B,
         "right": 0x7C,
         "down": 0x7D,
