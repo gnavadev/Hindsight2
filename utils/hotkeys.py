@@ -5,6 +5,8 @@ Windows: RegisterHotKey + WM_HOTKEY via QWidget.nativeEvent
 macOS:   Carbon RegisterEventHotKey on the *dispatcher* target
          (GetApplicationEventTarget never fires inside a Qt/Cocoa app)
          plus an NSEvent native filter as a second path.
+Linux:   xdg-desktop-portal GlobalShortcuts (Wayland) or XGrabKey (X11);
+         see utils/hotkeys_linux.py.
 
 macOS chord is Control+Command (⌃⌘). Plain Control is eaten by Emacs
 bindings, Terminal, and Mission Control (Control+Arrows).
@@ -46,13 +48,29 @@ class HotkeyManager:
         return None
 
 
+class _NoopHotkeys(HotkeyManager):
+    """Fallback for platforms without a global-hotkey backend (e.g. Linux)."""
+
+    def register(self, hk_id: int, mod: str, key: str, callback: Callback) -> bool:
+        return False
+
+    def unregister(self, hk_id: int) -> None:
+        pass
+
+
 def create_hotkey_manager(widget) -> HotkeyManager:
     if sys.platform == "win32":
         return _WinHotkeys(widget)
     if sys.platform == "darwin":
         return _MacHotkeys()
+    if sys.platform.startswith("linux"):
+        from utils.hotkeys_linux import create_linux_hotkey_manager
+
+        mgr = create_linux_hotkey_manager()
+        if mgr is not None:
+            return mgr
     logger.warning("Global hotkeys are not implemented on this platform")
-    return HotkeyManager()
+    return _NoopHotkeys()
 
 
 # ── Windows ──────────────────────────────────────────────────────────
@@ -70,6 +88,7 @@ class _WinHotkeys(HotkeyManager):
         "b": 0x42,
         "p": 0x50,
         "r": 0x52,
+        "q": 0x51,
         "left": 0x25,
         "up": 0x26,
         "right": 0x27,
@@ -160,6 +179,7 @@ class _MacHotkeys(HotkeyManager):
         "b": 0x0B,
         "p": 0x23,
         "r": 0x0F,
+        "q": 0x0C,
         "left": 0x7B,
         "right": 0x7C,
         "down": 0x7D,

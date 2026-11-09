@@ -119,8 +119,12 @@ class MainWindow(PrivacyWindow):
     # ------------------------------------------------------------------
 
     def _position_toast(self):
-        """Position window in top-left corner"""
-        self.move(20, 50)
+        """Position window in top-left corner of the primary screen"""
+        from ui.privacy_window import primary_screen
+        screen = primary_screen()
+        origin = screen.geometry().topLeft() if screen else None
+        x, y = (origin.x(), origin.y()) if origin else (0, 0)
+        self.move_overlay(x + 20, y + 50)
 
     # ------------------------------------------------------------------
     # Resize
@@ -214,6 +218,7 @@ class MainWindow(PrivacyWindow):
             (chord_label("B"), "Hide/Show"),
             (chord_label("P"), "Privacy / Debug"),
             (chord_label("Arrows"), "Move"),
+            (chord_label("Shift+Q"), "Quit"),
         ]
 
         for i, (keys, desc) in enumerate(shortcuts):
@@ -294,9 +299,15 @@ class MainWindow(PrivacyWindow):
             (106, mod, "left", invoke(lambda: self.move_window(-step, 0))),
             (107, mod, "right", invoke(lambda: self.move_window(step, 0))),
             (108, mod, "r", invoke(self._handle_reset)),
+            (109, f"{mod}+shift", "q", invoke(self._quit_app)),
         ]
         for hk_id, m, key, cb in bindings:
             self._hotkeys.register(hk_id, m, key, cb)
+
+    def _quit_app(self):
+        logger.info("Quit requested via hotkey")
+        from PySide6.QtWidgets import QApplication
+        QApplication.quit()
 
     def _register_dynamic_hotkey(self, hk_id):
         if hk_id in self.registered_dynamic_ids or self._hotkeys is None:
@@ -345,28 +356,31 @@ class MainWindow(PrivacyWindow):
                 QTimer.singleShot(50, self.adjust_height_to_content)
                 return
 
-            geo = self.geometry()
-            center_x = geo.x() + geo.width() // 2
-            center_y = geo.y() + geo.height() // 2
+            center = self.overlay_center()
 
-            # Hide overlay so it cannot leak into the captured page
-            prev_privacy = self.privacy_enabled
-            self.set_privacy_mode(False)
-            prev_pos = self.pos()
-            self.move(-10000, -10000)
-            self.hide()
+            if self.capture_excluded_by_compositor():
+                # KWin already leaves every overlay window out of the capture;
+                # hiding it would only make it flicker and lose its position.
+                shot = capture_screenshot((center.x(), center.y()))
+            else:
+                # Hide overlay so it cannot leak into the captured page
+                prev_privacy = self.privacy_enabled
+                self.set_privacy_mode(False)
+                prev_pos = self.pos()
+                self.move(-10000, -10000)
+                self.hide()
 
-            QApplication.processEvents()
-            _time.sleep(0.35)
-            QApplication.processEvents()
+                QApplication.processEvents()
+                _time.sleep(0.35)
+                QApplication.processEvents()
 
-            shot = capture_screenshot((center_x, center_y))
+                shot = capture_screenshot((center.x(), center.y()))
 
-            self._privacy_enabled = prev_privacy
-            self.move(prev_pos)
-            self.show()
-            self.setAttribute(_WA.WA_ShowWithoutActivating)
-            self.set_privacy_mode(prev_privacy)
+                self._privacy_enabled = prev_privacy
+                self.move(prev_pos)
+                self.show()
+                self.setAttribute(_WA.WA_ShowWithoutActivating)
+                self.set_privacy_mode(prev_privacy)
 
             if shot:
                 self.current_images.append(shot)
@@ -635,8 +649,8 @@ class MainWindow(PrivacyWindow):
         self.resizeEvent(None)
 
     def move_window(self, dx, dy):
-        pos = self.pos()
-        self.move(pos.x() + dx, pos.y() + dy)
+        pos = self.overlay_pos()
+        self.move_overlay(pos.x() + dx, pos.y() + dy)
 
     # ------------------------------------------------------------------
     # LLM Init
@@ -700,7 +714,10 @@ class MainWindow(PrivacyWindow):
         if ok and api_key.strip():
             self.settings.set_api_key(provider_name, api_key)
             self._init_llm_provider()
-            self.response_viewer.setText("Assistant Ready\nListening...")
+            # On first launch this runs from __init__ before _setup_ui() has
+            # created the viewer; _setup_ui() sets its own initial text.
+            if hasattr(self, "response_viewer"):
+                self.response_viewer.setText("Assistant Ready\nListening...")
 
     def _handle_send_unused(self, message_data):
         pass
