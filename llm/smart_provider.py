@@ -49,8 +49,13 @@ UNIFIED_SCHEMA: Dict[str, Any] = {
         "solution": {
             "type": "object",
             "properties": {
+                "understanding": {"type": "string"},
+                "brute_force": {"type": "string"},
+                "key_insight": {"type": "string"},
                 "algorithm_steps": {"type": "array", "items": {"type": "string"}},
                 "code": {"type": "string"},
+                "dry_run": {"type": "string"},
+                "follow_ups": {"type": "array", "items": {"type": "string"}},
                 "language": {"type": "string"},
                 "time_complexity": {"type": "string"},
                 "space_complexity": {"type": "string"},
@@ -83,13 +88,28 @@ def _single_pass_prompt(user_text: str, image_count: int = 1) -> str:
             "general": "open-ended / other",
         },
         "solution_fields": {
-            "coding": ["algorithm_steps[]", "code", "language", "time_complexity", "space_complexity", "edge_cases[]"],
+            "coding": [
+                "understanding: restate the problem, inputs/outputs, constraints and assumptions (1-3 sentences)",
+                "brute_force: the naive approach, its complexity, and why it is not good enough (1-2 sentences)",
+                "key_insight: the core idea behind the optimal solution and WHY it is correct (2-4 sentences)",
+                "algorithm_steps[]: short imperative steps",
+                "code",
+                "language",
+                "dry_run: trace the code on one small example, step by step (2-4 short sentences)",
+                "time_complexity: Big-O plus a short justification, e.g. 'O(n): one pass, O(1) hash lookups'",
+                "space_complexity: Big-O plus a short justification",
+                "edge_cases[]: each case AND how the code handles it",
+                "follow_ups[]: up to 3 likely interviewer follow-ups or trade-offs, each with a one-line answer",
+            ],
             "multiple_choice": ["selected_option", "option_letter", "all_options{}", "explanation"],
             "math": ["final_answer", "step_by_step[]", "formula_used"],
             "general": ["answer", "reasoning"],
         },
         "rules": [
             "Fill only fields for the chosen type",
+            "coding: explain the way a strong candidate talks an interviewer through a "
+            "technical interview, showing they grasp every concept: clear, first-person, "
+            "concise sentences, no filler",
             "code: raw, no markdown fences, \\n for newlines",
             "arrays: one item per step/case, never merge",
             "Do not transcribe the whole image",
@@ -137,6 +157,9 @@ class SmartProvider(BaseLLMProvider):
         images: Optional[List[Image.Image]] = None,
     ) -> Dict[str, Any]:
         return self.backend.send_with_json_output(text, json_schema, images)
+
+    def transcribe_audio(self, audio_path: str) -> str:
+        return self.backend.transcribe_audio(audio_path)
 
     def send_message(
         self,
@@ -240,15 +263,29 @@ class SmartProvider(BaseLLMProvider):
             logger.error(f"Formatter crashed for type={ptype}: {e}", exc_info=True)
             return self._format_raw_fallback(solution_data, ptype)
 
+    @staticmethod
+    def _numbered(items: List[str]) -> str:
+        return "".join(f"{i}. {item}\n" for i, item in enumerate(items, 1)) + "\n"
+
+    @staticmethod
+    def _bulleted(items: List[str]) -> str:
+        return "".join(f"- {item}\n" for item in items) + "\n"
+
     def _fmt_coding(self, sol: Dict, info: Dict) -> str:
-        md = "**Type:** `CODING`\n\n"
+        # Interview order: understand -> naive -> insight -> plan -> code -> verify
+        md = ""
+        for key, title in (
+            ("understanding", "Understanding the problem"),
+            ("brute_force", "Brute force"),
+            ("key_insight", "Key insight"),
+        ):
+            text = (sol.get(key) or "").strip()
+            if text:
+                md += f"### {title}\n\n{text}\n\n"
 
         steps = self._safe_list(sol, "algorithm_steps")
         if steps:
-            md += "### Algorithm Steps\n\n"
-            for i, step in enumerate(steps, 1):
-                md += f"**{i}.** {step}<br>\n"
-            md += "\n"
+            md += "### Approach\n\n" + self._numbered(steps)
 
         code = self._sanitize_code(sol.get("code", "") or sol.get("answer", ""))
         lang = (
@@ -259,26 +296,30 @@ class SmartProvider(BaseLLMProvider):
         if code:
             md += f"### Code\n\n```{lang}\n{code}\n```\n\n"
 
-        edge_cases = self._safe_list(sol, "edge_cases")
-        if edge_cases:
-            md += "### Edge Cases\n\n"
-            for ec in edge_cases:
-                md += f"- {ec}\n"
-            md += "\n"
+        dry_run = (sol.get("dry_run") or "").strip()
+        if dry_run:
+            md += f"### Dry run\n\n{dry_run}\n\n"
 
         tc = sol.get("time_complexity")
         sc = sol.get("space_complexity")
         if tc or sc:
             md += "### Complexity\n\n"
-            if tc:
-                md += f"**Time:** {tc}\n\n"
-            if sc:
-                md += f"**Space:** {sc}\n\n"
+            md += self._bulleted(
+                ([f"**Time:** {tc}"] if tc else []) + ([f"**Space:** {sc}"] if sc else [])
+            )
+
+        edge_cases = self._safe_list(sol, "edge_cases")
+        if edge_cases:
+            md += "### Edge cases\n\n" + self._bulleted(edge_cases)
+
+        follow_ups = self._safe_list(sol, "follow_ups")
+        if follow_ups:
+            md += "### Possible follow-ups\n\n" + self._bulleted(follow_ups)
 
         return md.strip()
 
     def _fmt_multiple_choice(self, sol: Dict, info: Dict) -> str:
-        md = "**Type:** `MULTIPLE CHOICE`\n\n"
+        md = ""
 
         letter = sol.get("option_letter", "?")
         selected = sol.get("selected_option", "")
@@ -291,7 +332,8 @@ class SmartProvider(BaseLLMProvider):
             md += "### Options\n\n"
             for key in sorted(all_opts.keys()):
                 marker = "✅" if str(key).upper() == str(letter).upper() else "⬚"
-                md += f"{marker} **{key}.** {all_opts[key]}\n\n"
+                md += f"- {marker} **{key}.** {all_opts[key]}\n"
+            md += "\n"
 
         explanation = sol.get("explanation", "")
         if explanation:
@@ -300,14 +342,11 @@ class SmartProvider(BaseLLMProvider):
         return md.strip()
 
     def _fmt_math(self, sol: Dict, info: Dict) -> str:
-        md = "**Type:** `MATH`\n\n"
+        md = ""
 
         steps = self._safe_list(sol, "step_by_step")
         if steps:
-            md += "### Step-by-Step Solution\n\n"
-            for i, step in enumerate(steps, 1):
-                md += f"**{i}.** {step}<br>\n"
-            md += "\n"
+            md += "### Step-by-step solution\n\n" + self._numbered(steps)
 
         answer = sol.get("final_answer", "")
         if answer:
@@ -320,8 +359,7 @@ class SmartProvider(BaseLLMProvider):
         return md.strip()
 
     def _fmt_general(self, sol: Dict, info: Dict) -> str:
-        ptype = info.get("problem_type", "general").upper()
-        md = f"**Type:** `{ptype}`\n\n"
+        md = ""
 
         reasoning = sol.get("reasoning", "")
         answer = sol.get("answer", "")
@@ -336,8 +374,7 @@ class SmartProvider(BaseLLMProvider):
     def _format_raw_fallback(self, data: Dict, ptype: str) -> str:
         """Last-resort renderer — always shows *something* useful."""
         logger.debug(f"Raw fallback triggered for type={ptype}")
-        md = f"**Type:** `{ptype.upper()}`\n\n"
-        md += "### Response\n\n"
+        md = ""
 
         if isinstance(data, dict):
             for key in ("solution", "answer", "response", "text", "raw"):

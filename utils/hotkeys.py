@@ -38,7 +38,8 @@ def chord_label(key: str) -> str:
 
 
 class HotkeyManager:
-    def register(self, hk_id: int, mod: str, key: str, callback: Callback) -> bool:
+    def register(self, hk_id: int, mod: str, key: str, callback: Callback,
+                 repeat: bool = False) -> bool:
         raise NotImplementedError
 
     def unregister(self, hk_id: int) -> None:
@@ -51,7 +52,8 @@ class HotkeyManager:
 class _NoopHotkeys(HotkeyManager):
     """Fallback for platforms without a global-hotkey backend (e.g. Linux)."""
 
-    def register(self, hk_id: int, mod: str, key: str, callback: Callback) -> bool:
+    def register(self, hk_id: int, mod: str, key: str, callback: Callback,
+                 repeat: bool = False) -> bool:
         return False
 
     def unregister(self, hk_id: int) -> None:
@@ -89,6 +91,7 @@ class _WinHotkeys(HotkeyManager):
         "p": 0x50,
         "r": 0x52,
         "q": 0x51,
+        "]": 0xDD,  # VK_OEM_6
         "left": 0x25,
         "up": 0x26,
         "right": 0x27,
@@ -118,7 +121,8 @@ class _WinHotkeys(HotkeyManager):
                 bits |= self.MOD_SHIFT
         return bits
 
-    def register(self, hk_id: int, mod: str, key: str, callback: Callback) -> bool:
+    def register(self, hk_id: int, mod: str, key: str, callback: Callback,
+                 repeat: bool = False) -> bool:
         vk = self._VK.get(key.lower())
         if vk is None:
             logger.warning(f"Unknown hotkey key: {key}")
@@ -180,6 +184,7 @@ class _MacHotkeys(HotkeyManager):
         "p": 0x23,
         "r": 0x0F,
         "q": 0x0C,
+        "]": 0x1E,  # kVK_ANSI_RightBracket
         "left": 0x7B,
         "right": 0x7C,
         "down": 0x7D,
@@ -357,7 +362,8 @@ class _MacHotkeys(HotkeyManager):
                 bits |= self.shiftKey
         return bits
 
-    def register(self, hk_id: int, mod: str, key: str, callback: Callback) -> bool:
+    def register(self, hk_id: int, mod: str, key: str, callback: Callback,
+                 repeat: bool = False) -> bool:
         kc = self._KC.get(key.lower())
         if kc is None:
             logger.warning(f"Unknown hotkey key: {key}")

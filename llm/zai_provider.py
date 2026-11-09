@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 ZAI_BASE_URL = "https://api.z.ai/api/paas/v4/"
 DEFAULT_MODEL = "glm-5.3-flash"
+ASR_MODEL = "glm-asr-2512"  # speech-to-text; max 30 s of audio per request
 
 
 class ZaiProvider(BaseLLMProvider):
@@ -92,6 +93,29 @@ class ZaiProvider(BaseLLMProvider):
         if text:
             content.append({"type": "text", "text": text})
         return content
+
+    def transcribe_audio(self, audio_path: str) -> str:
+        """GLM-ASR accepts at most 30 s per request, so transcribe 25 s chunks
+        in parallel and join them in order."""
+        from concurrent.futures import ThreadPoolExecutor
+        from capture.system_audio import split_wav
+
+        chunks = split_wav(audio_path, max_seconds=25.0)
+        if not chunks:
+            logger.info("Recording is silent; nothing to transcribe")
+            return ""
+        logger.info(f"Transcribing {len(chunks)} audio chunk(s) with {ASR_MODEL}")
+
+        def one(item):
+            i, data = item
+            result = self.client.audio.transcriptions.create(
+                model=ASR_MODEL, file=(f"chunk{i}.wav", data, "audio/wav"),
+            )
+            return (getattr(result, "text", "") or "").strip()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            texts = list(pool.map(one, enumerate(chunks)))
+        return " ".join(t for t in texts if t)
 
     def _extra_body(self) -> Dict[str, Any]:
         # GLM-5.3-Flash cannot disable thinking; effort is the cost knob.

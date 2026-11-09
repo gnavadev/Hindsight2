@@ -35,6 +35,26 @@ class GeminiProvider(BaseLLMProvider):
             logger.critical(f"Failed to initialize Gemini Client: {e}")
             raise
 
+    def transcribe_audio(self, audio_path: str) -> str:
+        """Gemini understands audio natively; ask it for a plain transcript."""
+        uploaded = self.client.files.upload(file=audio_path)
+        try:
+            response = self.client.models.generate_content(
+                model=self._model_name,
+                contents=[
+                    "Transcribe the speech in this audio verbatim. Output only the "
+                    "transcript text, with no commentary. If there is no speech, "
+                    "output nothing.",
+                    uploaded,
+                ],
+            )
+            return (response.text or "").strip()
+        finally:
+            try:
+                self.client.files.delete(name=uploaded.name)
+            except Exception as e:
+                logger.debug(f"Could not delete uploaded audio {uploaded.name}: {e}")
+
     def send_message(
         self,
         text: str,

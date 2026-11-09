@@ -41,6 +41,7 @@ _DESCRIPTIONS = {
     "p": "Toggle privacy mode",
     "r": "Reset",
     "q": "Quit Hindsight",
+    "]": "Record PC audio (start / stop)",
     "up": "Move overlay up",
     "down": "Move overlay down",
     "left": "Move overlay left",
@@ -56,6 +57,7 @@ _KEYSYMS = {
     "p": "p",
     "r": "r",
     "q": "q",
+    "]": "bracketright",
     "up": "Up",
     "down": "Down",
     "left": "Left",
@@ -80,25 +82,71 @@ def _mod_parts(mod: str) -> List[str]:
 
 
 class _Bridge(QObject):
-    """Lives on the GUI thread; worker threads emit `fired`, slot runs on GUI thread."""
+    """Lives on the GUI thread; worker threads emit `fired` / `released`,
+    slots run on the GUI thread.
+
+    Hotkeys in `repeating` keep firing while held (the portal reports one
+    press and one release, with no key repeat in between)."""
 
     fired = Signal(int)
+    released = Signal(int)
+
+    REPEAT_DELAY_MS = 250     # like keyboard auto-repeat: pause, then repeat
+    REPEAT_INTERVAL_MS = 30
+    REPEAT_MAX_S = 15         # safety stop if a release is ever lost
 
     def __init__(self):
         super().__init__()
-        self.callbacks: Dict[int, Callback] = {}
-        self.fired.connect(self._dispatch)
+        from PySide6.QtCore import QTimer
 
-    @Slot(int)
-    def _dispatch(self, hk_id: int) -> None:
+        self.callbacks: Dict[int, Callback] = {}
+        self.repeating: Set[int] = set()
+        self._held: Optional[int] = None
+        self._held_since = 0.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._on_repeat)
+        self.fired.connect(self._dispatch)
+        self.released.connect(self._on_release)
+
+    def _call(self, hk_id: int) -> None:
         cb = self.callbacks.get(hk_id)
         if cb is None:
             return
-        logger.info(f"Hotkey {hk_id} fired")
         try:
             cb()
         except Exception as e:
             logger.error(f"Hotkey {hk_id} callback failed: {e}", exc_info=True)
+
+    @Slot(int)
+    def _dispatch(self, hk_id: int) -> None:
+        if hk_id not in self.callbacks:
+            return
+        logger.info(f"Hotkey {hk_id} fired")
+        self._call(hk_id)
+        if hk_id in self.repeating:
+            import time
+            self._held, self._held_since = hk_id, time.monotonic()
+            self._timer.start(self.REPEAT_DELAY_MS)
+        elif self._held is not None:
+            self._stop()
+
+    @Slot()
+    def _on_repeat(self) -> None:
+        import time
+        if self._held is None or time.monotonic() - self._held_since > self.REPEAT_MAX_S:
+            self._stop()
+            return
+        self._timer.setInterval(self.REPEAT_INTERVAL_MS)
+        self._call(self._held)
+
+    @Slot(int)
+    def _on_release(self, hk_id: int) -> None:
+        if hk_id == self._held:
+            self._stop()
+
+    def _stop(self) -> None:
+        self._timer.stop()
+        self._held = None
 
 
 # ── Wayland: xdg-desktop-portal GlobalShortcuts ──────────────────────
@@ -122,7 +170,8 @@ class PortalHotkeys:
 
     # -- public API (GUI thread) --------------------------------------
 
-    def register(self, hk_id: int, mod: str, key: str, callback: Callback) -> bool:
+    def register(self, hk_id: int, mod: str, key: str, callback: Callback,
+                 repeat: bool = False) -> bool:
         sym = _KEYSYMS.get(key.lower())
         if sym is None:
             logger.warning(f"Unknown hotkey key: {key}")
@@ -131,6 +180,8 @@ class PortalHotkeys:
         trigger = "+".join(mods + [sym])
         desc = _DESCRIPTIONS.get(key.lower(), f"{mod}+{key}")
         self._bridge.callbacks[hk_id] = callback
+        if repeat:
+            self._bridge.repeating.add(hk_id)
         self._ops.put(("bind", hk_id, trigger, desc))
         return True
 
@@ -171,13 +222,18 @@ class PortalHotkeys:
                 return
             logger.info(f"Using xdg-desktop-portal GlobalShortcuts v{version} for hotkeys")
 
-            rule = MatchRule(
-                type="signal", interface=self.IFACE, member="Activated", path=self.PATH
-            )
-            self._unwrap(self._router.send_and_get_reply(message_bus.AddMatch(rule)))
-            activated = self._router.filter(rule, bufsize=64)
+            # Activated = key pressed, Deactivated = key released (both from the
+            # same queue, so they stay in order)
+            signals: "queue.Queue" = queue.Queue(maxsize=256)
+            self._filters = []
+            for member in ("Activated", "Deactivated"):
+                rule = MatchRule(
+                    type="signal", interface=self.IFACE, member=member, path=self.PATH
+                )
+                self._unwrap(self._router.send_and_get_reply(message_bus.AddMatch(rule)))
+                self._filters.append(self._router.filter(rule, queue=signals))
             threading.Thread(
-                target=self._signal_loop, args=(activated.queue,),
+                target=self._signal_loop, args=(signals,),
                 name="portal-hotkeys-signals", daemon=True,
             ).start()
         except Exception as e:
@@ -334,9 +390,14 @@ class PortalHotkeys:
                     continue
                 hk_id = int(sid[2:])
                 if hk_id in ids:
-                    self._bridge.fired.emit(hk_id)
+                    from jeepney import HeaderFields
+                    member = msg.header.fields.get(HeaderFields.member)
+                    if member == "Deactivated":
+                        self._bridge.released.emit(hk_id)
+                    else:
+                        self._bridge.fired.emit(hk_id)
             except Exception as e:
-                logger.error(f"Bad portal Activated signal: {e}", exc_info=True)
+                logger.error(f"Bad portal shortcut signal: {e}", exc_info=True)
 
 
 # ── X11: XGrabKey ────────────────────────────────────────────────────
@@ -432,7 +493,8 @@ class X11Hotkeys:
         threading.Thread(target=self._run, name="x11-hotkeys", daemon=True).start()
         logger.info("Using X11 XGrabKey for hotkeys")
 
-    def register(self, hk_id: int, mod: str, key: str, callback: Callback) -> bool:
+    def register(self, hk_id: int, mod: str, key: str, callback: Callback,
+                 repeat: bool = False) -> bool:
         sym = _KEYSYMS.get(key.lower())
         if sym is None:
             logger.warning(f"Unknown hotkey key: {key}")

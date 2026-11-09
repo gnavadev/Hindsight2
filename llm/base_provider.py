@@ -45,6 +45,12 @@ class BaseLLMProvider(ABC):
         """
         pass
     
+    def transcribe_audio(self, audio_path: str) -> str:
+        """Speech-to-text for a WAV file. Providers without an audio path raise."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot transcribe audio; use the Z.AI or Gemini provider"
+        )
+
     def parse_structured_output(self, response_text: str) -> Dict[str, Any]:
         """
         Parse structured JSON output from LLM response reliably.

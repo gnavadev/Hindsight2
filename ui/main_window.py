@@ -9,6 +9,7 @@ Combines all UI components into the main application window with:
 """
 
 import logging
+import re
 import sys
 import time
 from PySide6.QtWidgets import (
@@ -33,22 +34,86 @@ class _LlmSendWorker(QObject):
 
     finished = Signal(object, float, int)
     failed = Signal(str, float, int)
+    status = Signal(str)
 
-    def __init__(self, provider, text, images):
+    def __init__(self, provider, text, images, audio_paths=None):
         super().__init__()
         self._provider = provider
         self._text = text
         self._images = images
+        self._audio_paths = list(audio_paths or [])
 
     def run(self):
         n = len(self._images)
         t0 = time.time()
         try:
-            result = self._provider.send_message(text=self._text, images=self._images)
+            text = self._text
+            if self._audio_paths:
+                self.status.emit("Transcribing PC audio…")
+                parts = [self._provider.transcribe_audio(p) for p in self._audio_paths]
+                transcript = "\n".join(t for t in parts if t).strip()
+                logger.info(f"Transcript: {len(transcript)} chars")
+                if not transcript and not self._images:
+                    raise RuntimeError("No speech found in the recorded PC audio")
+                text = _with_transcript(text, transcript, bool(self._images))
+                self.status.emit("Sending to LLM…")
+            result = self._provider.send_message(text=text, images=self._images)
             self.finished.emit(result, time.time() - t0, n)
         except Exception as e:
             logger.error(f"LLM send failed: {e}", exc_info=True)
             self.failed.emit(str(e), time.time() - t0, n)
+
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+def _normalize_markdown(md: str) -> str:
+    """LLMs write one newline where Markdown needs a blank line, so lists,
+    headings, quotes and paragraphs get folded together ("1. a 2. b" on one
+    line). Treat each line as its own block, except where lines belong
+    together: consecutive list items, indented continuations, tables, quotes.
+    Code blocks are left untouched."""
+    out, prev, in_code = [], "", False
+    for line in (md or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            if not in_code and prev.strip():
+                out.append("")
+            in_code = not in_code
+        elif not in_code and stripped and prev.strip():
+            p = prev.strip()
+            together = (
+                (_LIST_ITEM.match(line) and _LIST_ITEM.match(prev))
+                or line.startswith((" ", "\t"))
+                or (stripped.startswith("|") and p.startswith("|"))
+                or (stripped.startswith(">") and p.startswith(">"))
+            )
+            if not together:
+                out.append("")
+        out.append(line)
+        prev = "" if in_code and not stripped.startswith(("```", "~~~")) else line
+    return "\n".join(out)
+
+
+def _with_transcript(text: str, transcript: str, has_images: bool) -> str:
+    if not transcript:
+        return text
+    block = (
+        "Transcript of PC audio recorded during a conversation (what the other "
+        "person said; automatic speech-to-text, may contain errors):\n"
+        f'"""\n{transcript}\n"""'
+    )
+    if has_images:
+        return f"{text}\n\n{block}\nUse the transcript as additional context."
+    return (
+        f"{block}\n\nIdentify the question, request or problem in what they said "
+        "and give the best answer or reply to it. Format for quick reading on a "
+        "small overlay, in Markdown:\n"
+        "- Start with the direct answer or the reply to say, in 1-3 sentences.\n"
+        "- Then at most 4 short bullet points with key details, if useful.\n"
+        "- No preamble, no restating the question, no closing offers.\n"
+        "- Leave a blank line between paragraphs and before lists."
+    )
+
 
 # ------------------------
 # PySide6 v6 enum aliases
@@ -82,7 +147,7 @@ class MainWindow(PrivacyWindow):
         self.setAttribute(_WA.WA_ShowWithoutActivating)
         if sys.platform == "darwin":
             self.setAttribute(_WA.WA_MacAlwaysShowToolWindow, True)
-        self.setWindowOpacity(0.85)
+        self.setWindowOpacity(1.0)  # text must not mix with what's behind
         self.set_click_through(True)
 
         # 3. Start small; expand once content is ready
@@ -95,6 +160,12 @@ class MainWindow(PrivacyWindow):
         self.privacy_enabled = True
         self.debug_mode = False
         self.current_images = []
+        self.current_audio = []  # recorded PC-audio WAVs waiting to be sent
+        from capture.system_audio import SystemAudioRecorder
+        self.recorder = SystemAudioRecorder()
+        self._rec_timer = QTimer(self)
+        self._rec_timer.setInterval(1000)
+        self._rec_timer.timeout.connect(self._show_capture_status)
         self._max_pages = 8
         self._send_in_progress = False
         self._llm_thread = None
@@ -189,7 +260,7 @@ class MainWindow(PrivacyWindow):
         container.setAttribute(_WA.WA_StyledBackground, True)
         container.setStyleSheet("""
             QWidget#container {
-                background-color: rgba(30, 30, 30, 240);
+                background-color: rgb(24, 24, 27);
                 border: 1px solid rgba(255, 255, 255, 30);
                 border-radius: 10px;
             }
@@ -218,6 +289,7 @@ class MainWindow(PrivacyWindow):
             (chord_label("B"), "Hide/Show"),
             (chord_label("P"), "Privacy / Debug"),
             (chord_label("Arrows"), "Move"),
+            (chord_label("]"), "Record PC audio"),
             (chord_label("Shift+Q"), "Quit"),
         ]
 
@@ -249,8 +321,8 @@ class MainWindow(PrivacyWindow):
         self.response_viewer = QTextBrowser()
         self.response_viewer.setStyleSheet("""
             QTextBrowser {
-                color: #e0e0e0;
-                font-size: 14px;
+                color: #e4e4e7;
+                font-size: 15px;
                 background: transparent;
                 border: none;
             }
@@ -300,12 +372,16 @@ class MainWindow(PrivacyWindow):
             (107, mod, "right", invoke(lambda: self.move_window(step, 0))),
             (108, mod, "r", invoke(self._handle_reset)),
             (109, f"{mod}+shift", "q", invoke(self._quit_app)),
+            (110, mod, "]", invoke(self._toggle_recording)),
         ]
+        # Ctrl+Arrows keep moving the overlay while held
+        repeating = {104, 105, 106, 107}
         for hk_id, m, key, cb in bindings:
-            self._hotkeys.register(hk_id, m, key, cb)
+            self._hotkeys.register(hk_id, m, key, cb, repeat=hk_id in repeating)
 
     def _quit_app(self):
         logger.info("Quit requested via hotkey")
+        self._discard_audio()
         from PySide6.QtWidgets import QApplication
         QApplication.quit()
 
@@ -386,14 +462,7 @@ class MainWindow(PrivacyWindow):
                 self.current_images.append(shot)
                 self._refresh_image_previews()
                 n = len(self.current_images)
-                self.response_viewer.setHtml(
-                    f"<b>{n}</b> page{'s' if n != 1 else ''} captured. "
-                    f"<b>{chord_label('H')}</b> add another · "
-                    f"<b>{chord_label('Enter')}</b> send all · "
-                    f"<b>{chord_label('R')}</b> reset"
-                )
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(50, self.adjust_height_to_content)
+                self._show_capture_status()
                 self._register_dynamic_hotkey(201)
                 logger.info(f"Screenshot captured ({n}/{self._max_pages})")
             else:
@@ -403,6 +472,92 @@ class MainWindow(PrivacyWindow):
         except Exception as e:
             logger.error(f"Screenshot error: {e}", exc_info=True)
             self.response_viewer.setText(f"Screenshot error: {e}")
+
+    # ------------------------------------------------------------------
+    # PC audio recording
+    # ------------------------------------------------------------------
+
+    def _toggle_recording(self):
+        if self.recorder.is_recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self):
+        if self._send_in_progress:
+            return
+        try:
+            self.recorder.start()
+        except Exception as e:
+            logger.error(f"Could not start PC audio recording: {e}")
+            self.response_viewer.setText(f"Recording failed: {e}")
+            QTimer.singleShot(50, self.adjust_height_to_content)
+            return
+        self._rec_timer.start()
+        self._register_dynamic_hotkey(201)
+        self._show_capture_status()
+
+    def _stop_recording(self, update_status: bool = True):
+        self._rec_timer.stop()
+        try:
+            path = self.recorder.stop()
+        except Exception as e:
+            logger.error(f"Stopping PC audio recording failed: {e}", exc_info=True)
+            path = None
+        if path:
+            self.current_audio.append(path)
+        if update_status:
+            self._show_capture_status()
+
+    def _discard_audio(self):
+        from capture.system_audio import discard
+        self._rec_timer.stop()
+        self.recorder.cancel()
+        discard(self.current_audio)
+        self.current_audio = []
+
+    def _audio_seconds(self) -> float:
+        import wave
+        total = 0.0
+        for path in self.current_audio:
+            try:
+                with wave.open(path, "rb") as w:
+                    total += w.getnframes() / float(w.getframerate())
+            except Exception:
+                pass
+        return total
+
+    def _show_capture_status(self):
+        """One status line for everything queued: pages, recordings, live recording."""
+        def mmss(sec):
+            sec = int(sec)
+            return f"{sec // 60}:{sec % 60:02d}"
+
+        lines = []
+        if self.recorder.is_recording:
+            lines.append(
+                f"<span style='color:#ff4d4d;'>● Recording PC audio</span> "
+                f"<b>{mmss(self.recorder.elapsed)}</b>"
+            )
+        queued = []
+        n = len(self.current_images)
+        if n:
+            queued.append(f"<b>{n}</b> page{'s' if n != 1 else ''}")
+        if self.current_audio:
+            queued.append(f"<b>{mmss(self._audio_seconds())}</b> of PC audio")
+        if queued:
+            lines.append(" + ".join(queued) + " captured.")
+        if not lines:
+            self.response_viewer.setHtml("Listening...")
+        else:
+            hints = []
+            hints.append(f"<b>{chord_label(']')}</b> "
+                         f"{'stop' if self.recorder.is_recording else 'record'}")
+            hints.append(f"<b>{chord_label('H')}</b> add page")
+            hints.append(f"<b>{chord_label('Enter')}</b> send")
+            hints.append(f"<b>{chord_label('R')}</b> reset")
+            self.response_viewer.setHtml("<br>".join(lines) + "<br>" + " · ".join(hints))
+        QTimer.singleShot(50, self.adjust_height_to_content)
 
     def _refresh_image_previews(self):
         """Rebuild the thumbnail strip from current_images."""
@@ -443,8 +598,10 @@ class MainWindow(PrivacyWindow):
         self.preview_container.show()
 
     def _handle_send(self):
-        if not self.current_images:
-            logger.debug("_handle_send called but no images queued")
+        if self.recorder.is_recording:
+            self._stop_recording(update_status=False)
+        if not self.current_images and not self.current_audio:
+            logger.debug("_handle_send called but nothing queued")
             return
         if self._send_in_progress:
             logger.debug("_handle_send ignored — request already in flight")
@@ -457,18 +614,24 @@ class MainWindow(PrivacyWindow):
 
         self._unregister_dynamic_hotkey(201)
         images = list(self.current_images)
+        audio = list(self.current_audio)
         n = len(images)
         self.preview_container.hide()
         pages = "page" if n == 1 else "pages"
+        what = f"{n} {pages}" if n else "PC audio"
+        if n and audio:
+            what += " + PC audio"
         self.response_viewer.setHtml(
-            f"Sending {n} {pages} to LLM…"
+            f"{'Transcribing PC audio' if audio else f'Sending {what} to LLM'}…"
             f"<br><span style='color:#888'>Waiting for response</span>"
         )
         self.adjust_height_to_content()
         self.repaint()
         QApplication.processEvents()
 
-        if n > 1:
+        if n == 0:
+            text = ""
+        elif n > 1:
             text = (
                 f"These {n} images are sequential pages of the same problem. "
                 "Use every page together as one context."
@@ -478,8 +641,9 @@ class MainWindow(PrivacyWindow):
 
         self._send_in_progress = True
         thread = QThread(self)
-        worker = _LlmSendWorker(self.llm_provider, text, images)
+        worker = _LlmSendWorker(self.llm_provider, text, images, audio)
         worker.moveToThread(thread)
+        worker.status.connect(self._on_send_status)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_llm_finished)
         worker.failed.connect(self._on_llm_failed)
@@ -489,11 +653,17 @@ class MainWindow(PrivacyWindow):
         thread.finished.connect(thread.deleteLater)
         self._llm_thread = thread
         self._llm_worker = worker
-        logger.info(f"Sending {n} image(s) to LLM provider...")
+        logger.info(f"Sending {n} image(s) and {len(audio)} recording(s) to LLM provider...")
         thread.start()
+
+    def _on_send_status(self, text: str):
+        self.response_viewer.setHtml(
+            f"{text}<br><span style='color:#888'>Waiting for response</span>"
+        )
 
     def _on_llm_finished(self, response, elapsed, n):
         self._send_in_progress = False
+        self._discard_audio()  # transcribed and answered; don't keep recordings
         logger.info(f"LLM response received in {elapsed:.1f}s")
         text_response = (response or {}).get("response", "No response")
         metadata = (response or {}).get("metadata", {}) or {}
@@ -537,8 +707,8 @@ class MainWindow(PrivacyWindow):
         """Convert markdown text to styled HTML for the response viewer."""
         try:
             html_content = markdown.markdown(
-                md_text,
-                extensions=['fenced_code', 'codehilite']
+                _normalize_markdown(md_text),
+                extensions=['fenced_code', 'codehilite', 'sane_lists', 'tables']
             )
         except Exception as e:
             logger.warning(f"Markdown rendering failed, using plain text: {e}")
@@ -546,23 +716,48 @@ class MainWindow(PrivacyWindow):
             import html
             html_content = html.escape(md_text).replace('\n', '<br>')
 
+        # Qt paints a <pre> background line by line (gaps between lines), so
+        # put each code block in a one-cell table, which gets one solid box.
+        html_content = re.sub(r"\n</code></pre>", "</code></pre>", html_content)
+        html_content = re.sub(
+            r'<div class="codehilite">(.*?)</div>',
+            r'<table width="100%" cellspacing="0" cellpadding="10" class="code">'
+            r'<tr><td class="codehilite">\1</td></tr></table>',
+            html_content,
+            flags=re.S,
+        )
+
         formatter = HtmlFormatter(style='monokai', noclasses=True)
         pygments_css = formatter.get_style_defs('.codehilite')
 
         return f"""
         <style>
-            body {{ font-family: 'Segoe UI', sans-serif; color: #e0e0e0; margin: 0; }}
-            p {{ margin-bottom: 10px; margin-top: 0; }}
-            a {{ color: #4facfe; }}
-            pre {{
-                background-color: #272822;
-                padding: 12px;
-                border-radius: 6px;
-                border: 1px solid #444;
-                overflow-x: auto;
-                margin: 8px 0;
-                line-height: 1.2;
+            body {{ color: #e4e4e7; margin: 0; line-height: 145%; }}
+            p {{ margin-top: 0; margin-bottom: 12px; }}
+            h1, h2, h3, h4 {{ color: #ffffff; margin-top: 14px; margin-bottom: 6px; }}
+            h1 {{ font-size: 19px; }} h2 {{ font-size: 17px; }}
+            h3, h4 {{ font-size: 15px; }}
+            strong, b {{ color: #ffffff; }}
+            ul, ol {{ margin-top: 2px; margin-bottom: 12px; margin-left: 4px; }}
+            li {{ margin-bottom: 6px; }}
+            blockquote {{
+                margin: 4px 0 12px 12px;
+                color: #bae6fd;
+                font-style: italic;
             }}
+            hr {{ color: #3f3f46; }}
+            table {{ margin-bottom: 12px; border-collapse: collapse; }}
+            th, td {{ padding: 4px 10px; border: 1px solid #3f3f46; }}
+            th {{ color: #ffffff; background-color: #27272a; }}
+            a {{ color: #4facfe; }}
+            table.code {{
+                background-color: #272822;
+                border: 1px solid #3f3f46;
+                margin-top: 4px;
+                margin-bottom: 4px;
+            }}
+            table.code td {{ border: none; padding: 10px; }}
+            pre {{ margin: 0; line-height: 125%; }}
             pre * {{ margin: 0; padding: 0; }}
             code {{ font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; }}
             p code {{ background-color: #3e3e3e; padding: 2px 5px; border-radius: 4px; }}
@@ -577,7 +772,7 @@ class MainWindow(PrivacyWindow):
         - Width grows first (up to half screen), then height grows without limit.
         """
         screen    = self.screen().availableGeometry()
-        max_width = screen.width() // 2
+        max_width = min(screen.width() // 2, 760)
         overhead  = 60  # legend bar + layout margins
         if self.preview_container.isVisible():
             overhead += max(96, self.preview_container.sizeHint().height())
@@ -600,6 +795,7 @@ class MainWindow(PrivacyWindow):
         exclude_widget_from_capture(widget, True)
 
     def _handle_reset(self):
+        self._discard_audio()
         self.current_images.clear()
         self._refresh_image_previews()
         self.response_viewer.setHtml("Listening...")
